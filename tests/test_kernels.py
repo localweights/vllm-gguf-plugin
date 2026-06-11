@@ -10,6 +10,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
 import vllm_gguf_plugin.ops as ops
 from vllm_gguf_plugin.quantization.fused_moe import _fused_moe_gguf
+from vllm_gguf_plugin.quantization.vocal_embeds import apply_gguf_embedding
 from vllm_gguf_plugin.triton.fused_moe import ggml_moe_a8_triton
 from vllm_gguf_plugin.triton.fused_moe.utils import get_triton_moe_block_m
 from vllm_gguf_plugin.triton.gemm.interface import ggml_mul_mat_a8_triton
@@ -94,6 +95,33 @@ def test_dequantize(
             *list(shape),
             dtype=dtype,
         )
+
+        torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=4e-2)
+
+
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("quant_type", QUANT_TYPES)
+@torch.inference_mode()
+def test_gguf_embedding(
+    hidden_size: int, dtype: torch.dtype, quant_type: GGMLQuantizationType
+):
+    tensors = get_gguf_sample_tensors(hidden_size, quant_type)
+    for tensor in tensors:
+        qweight = torch.tensor(tensor.data, device="cuda")
+        weight = torch.tensor(dequantize(tensor.data, quant_type), device="cuda").to(
+            dtype
+        )
+        ids = torch.tensor(
+            [[0, qweight.shape[0] - 1], [qweight.shape[0] // 2, 0]],
+            device="cuda",
+            dtype=torch.long,
+        )
+
+        output = apply_gguf_embedding(
+            ids, qweight, quant_type, hidden_size, dtype=dtype
+        )
+        ref_output = torch.embedding(weight, ids)
 
         torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=4e-2)
 
