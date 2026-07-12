@@ -153,9 +153,7 @@ if (
         top_k: torch.SymInt,
         tokens: torch.SymInt,
     ) -> torch.Tensor:
-        return torch.empty(
-            (X.size(0) * top_k, row), dtype=torch.float16, device=W.device
-        )
+        return torch.empty((X.size(0) * top_k, row), dtype=X.dtype, device=W.device)
 
 
 if (
