@@ -19,6 +19,7 @@ from .config_parser import GGUFConfigParser
 from .gguf_utils import check_gguf_file, is_gguf, is_remote_gguf, split_remote_gguf
 from .loader import GGUFModelLoader
 from .quantization import DiffusionGGUFConfig, GGUFConfig
+from .qwen35_config import register as _register_qwen35_gguf
 from .weights_adapter.diffusion.integration import _patch_diffusers_loader
 
 OOTGGUFConfig = GGUFConfig
@@ -125,3 +126,4 @@ def register() -> None:
     _patch_engine_args()
     _patch_speculator_probe()
     _patch_diffusers_loader()
+    _register_qwen35_gguf()
