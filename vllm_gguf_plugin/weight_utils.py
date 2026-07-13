@@ -3,6 +3,7 @@
 import glob
 import itertools
 import os
+import re as _re
 from collections.abc import Generator
 from pathlib import Path
 
@@ -150,3 +151,59 @@ def get_gguf_unquantized_params(gguf_files: list[str]) -> list[str]:
     #     for tensor in reader.tensors:
     #         if tensor.tensor_type.name in unquant_types:
     #             yield tensor.name.rsplit(".", 1)[0]
+
+
+# D4 — fail-closed MTP skip for qwen35/qwen35moe
+# Owner: prepare_loading() calls this after build_name_map;
+#        success → skipped count logged, failure → GGUFUnmappedTensorError raised.
+
+_BLK_IDX_RE = _re.compile(r"^blk\.(\d+)\.")
+
+
+def partition_unmapped_gguf_tensors(
+    gguf_names: set[str],
+    mapped_keys: set[str],
+    num_hidden_layers: int,
+    arch: str,
+) -> int:
+    """Partition unmapped GGUF tensor names into MTP (skipped) vs error.
+
+    For qwen35/qwen35moe arches, tensors in block indices >= num_hidden_layers
+    belong to the MTP (NextN prediction) layer and are silently skipped with a
+    log line.  Any other unmapped tensor raises GGUFUnmappedTensorError.
+
+    For non-qwen35 arches, any unmapped tensor is an error.
+
+    Returns the number of MTP tensors skipped.
+
+    Raises GGUFUnmappedTensorError if non-MTP unmapped tensors exist.
+    """
+    from .errors import GGUFUnmappedTensorError
+
+    unmapped = gguf_names - mapped_keys
+    if not unmapped:
+        return 0
+
+    if arch not in ("qwen35", "qwen35moe"):
+        raise GGUFUnmappedTensorError(unmapped)
+
+    mtp_tensors: list[str] = []
+    error_tensors: list[str] = []
+    for name in unmapped:
+        m = _BLK_IDX_RE.match(name)
+        if m:
+            idx = int(m.group(1))
+            if idx >= num_hidden_layers:
+                mtp_tensors.append(name)
+                continue
+        error_tensors.append(name)
+
+    if error_tensors:
+        raise GGUFUnmappedTensorError(error_tensors)
+
+    if mtp_tensors:
+        logger.info(
+            "skipped %d MTP tensors (serving path does not use MTP)",
+            len(mtp_tensors),
+        )
+    return len(mtp_tensors)

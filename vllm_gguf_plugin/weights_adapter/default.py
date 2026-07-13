@@ -19,6 +19,7 @@ from ..weight_utils import (
     get_gguf_extra_tensor_names,
     get_gguf_weight_type_map,
     gguf_quant_weights_iterator_multi,
+    partition_unmapped_gguf_tensors,
 )
 from .base import BaseGGUFWeightsAdapter, GGUFLoadSpec
 
@@ -27,6 +28,12 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 logger = init_logger(__name__)
+
+# Gap #1: our HF model_type uses underscores, gguf uses no underscores
+_QWEN35_ARCH_MAP: dict[str, gguf.MODEL_ARCH] = {
+    "qwen3_5_text": gguf.MODEL_ARCH.QWEN35,
+    "qwen3_5_moe_text": gguf.MODEL_ARCH.QWEN35MOE,
+}
 
 
 class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
@@ -141,11 +148,14 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                     )
                 )
 
-        arch = None
-        for key, value in gguf.MODEL_ARCH_NAMES.items():
-            if value == model_type:
-                arch = key
-                break
+        # Gap #1 fix: resolve qwen3_5* model_type → QWEN35/QWEN35MOE arch directly
+        # before falling through to the generic reverse lookup.
+        arch = _QWEN35_ARCH_MAP.get(model_type)
+        if arch is None:
+            for key, value in gguf.MODEL_ARCH_NAMES.items():
+                if value == model_type:
+                    arch = key
+                    break
         if arch is None:
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
 
@@ -206,16 +216,45 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 gguf_name = text_name_map.get_name(base_name)
             if gguf_name is None:
                 return None
-            return gguf_name + "." + suffix
+            # Suffix-less params (e.g. GDN A_log -> ssm_a) must map to the bare
+            # gguf tensor name; appending a trailing "." would produce a key
+            # ("blk.N.ssm_a.") that can never match the real tensor ("blk.N.ssm_a"),
+            # silently dropping the weight. Only append when there is a suffix.
+            return f"{gguf_name}.{suffix}" if suffix else gguf_name
 
         unmapped_params = []
-        for hf_name in state_dict:
+        for hf_name in list(state_dict.keys()):
             gguf_name_with_suffix = find_hf_name_in_tensor_map(hf_name)
             if gguf_name_with_suffix is not None:
                 gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
                 logger.debug("Mapped GGUF %s → HF %s", gguf_name_with_suffix, hf_name)
             elif hf_name not in gguf_to_hf_name_map.values():
                 unmapped_params.append(hf_name)
+
+        # Gap #2 fix: for QWEN35/QWEN35MOE, add the missing dt_bias entries.
+        # gguf-py maps ssm_dt (block tensor 73) → dt_proj, but the GGUF stores
+        # the bias as a separate tensor `blk.{i}.ssm_dt.bias` which does NOT
+        # match any gguf-py mapping.  We must manually add these for every
+        # GDN (linear_attention) layer that actually has a dt_bias in the
+        # dummy state_dict.
+        if arch in (gguf.MODEL_ARCH.QWEN35, gguf.MODEL_ARCH.QWEN35MOE):
+            for hf_name in list(state_dict.keys()):
+                if hf_name.endswith(".linear_attn.dt_bias"):
+                    # Extract layer index from HF name
+                    m = re.search(r"\.layers\.(\d+)\.linear_attn\.dt_bias$", hf_name)
+                    if m:
+                        layer_idx = int(m.group(1))
+                        gguf_name = f"blk.{layer_idx}.ssm_dt.bias"
+                        if gguf_name not in gguf_to_hf_name_map:
+                            gguf_to_hf_name_map[gguf_name] = hf_name
+                            logger.debug(
+                                "Mapped GGUF %s → HF %s (dt_bias fixup)",
+                                gguf_name,
+                                hf_name,
+                            )
+                            # Remove from unmapped so it doesn't trigger the error
+                            if hf_name in unmapped_params:
+                                unmapped_params.remove(hf_name)
 
         if unmapped_params:
             unmapped_params = [
@@ -308,6 +347,25 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             model_path, model_config.hf_config
         )
         gguf_to_hf_name_map = self.build_name_map(model_config)
+
+        # D4: fail-closed GGUF-side skip for MTP tensors (qwen35/qwen35moe only)
+        text_config = model_config.hf_config.get_text_config()
+        arch_name = _QWEN35_ARCH_MAP.get(model_config.hf_config.model_type)
+        if arch_name is not None:
+            # Determine the arch string for the partition helper
+            arch_str = "qwen35moe" if arch_name == gguf.MODEL_ARCH.QWEN35MOE else "qwen35"
+            gguf_files = self._get_all_gguf_files(model_path)
+            all_gguf_names = set()
+            for gf in gguf_files:
+                reader = gguf.GGUFReader(gf)
+                all_gguf_names |= {t.name for t in reader.tensors}
+            partition_unmapped_gguf_tensors(
+                all_gguf_names,
+                set(gguf_to_hf_name_map.keys()),
+                text_config.num_hidden_layers,
+                arch_str,
+            )
+
         self.update_tie_word_embeddings(
             model_path, model_config.hf_config, gguf_to_hf_name_map
         )
