@@ -155,6 +155,23 @@ def _read_gguf_metadata(path) -> dict:
     return meta
 
 
+
+def _register_qwen35_causallm() -> None:
+    """Register the text-only Qwen3_5ForCausalLM / Qwen3_5MoeForCausalLM arches.
+
+    vLLM's registry only exposes the multimodal *ForConditionalGeneration variants,
+    which unconditionally build a vision tower (config.vision_config). A text-only
+    GGUF serve of this VL model must use the CausalLM class instead.
+    """
+    from vllm import ModelRegistry
+    for arch, path in (
+        ("Qwen3_5ForCausalLM", "vllm.model_executor.models.qwen3_5:Qwen3_5ForCausalLM"),
+        ("Qwen3_5MoeForCausalLM", "vllm.model_executor.models.qwen3_5:Qwen3_5MoeForCausalLM"),
+    ):
+        if arch not in ModelRegistry.get_supported_archs():
+            ModelRegistry.register_model(arch, path)
+
+
 def register() -> None:
     """Monkey-patch the transformers GGUF loader for qwen35 / qwen35moe.
 
@@ -222,3 +239,10 @@ def register() -> None:
     _gguf_utils.load_gguf_checkpoint = _wrapped_load_gguf_checkpoint
 
     _gguf_utils.load_gguf_checkpoint = _wrapped_load_gguf_checkpoint
+    _register_qwen35_causallm()
+
+    # Wire GGUF quant into embeddings/lm_head for models that omit quant_config
+    # on VocabParallelEmbedding (Qwen3.5/Qwen3-Next) — see embed_quant_patch.
+    from .embed_quant_patch import patch_vocab_embedding_gguf
+
+    patch_vocab_embedding_gguf()

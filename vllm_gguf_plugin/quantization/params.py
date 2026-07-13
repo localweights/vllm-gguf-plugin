@@ -39,8 +39,13 @@ def _resolve_gguf_weight_type_loader(
         return fallback_weight_loader
 
     def _gguf_weight_type_loader_v2(param, loaded_weight, loaded_shard_id=None):
-        if loaded_shard_id is None and hasattr(param, "_store"):
-            param._store(loaded_weight)
+        # Weight-type params only store the per-(shard) quant-type byte; their
+        # `_store` handles both the unsharded and sharded cases. Route ALL loads
+        # through it — the fallback base_loader (vLLM's linear weight_loader_v2)
+        # assumes an `output_dim` the uninitialized weight-type param lacks, which
+        # broke merged/sharded projections (GDN in_proj, attn qkv).
+        if hasattr(param, "_store"):
+            param._store(loaded_weight, loaded_shard_id)
             return
         base_loader(param, loaded_weight, loaded_shard_id)
 

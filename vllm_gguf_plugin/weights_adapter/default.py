@@ -275,6 +275,11 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
     ) -> Iterable[tuple[str, torch.Tensor]]:
         for hf_name, weight in weights:
             weight = self.transform_weight(hf_name, weight)
+            # GDN causal conv is modelled as a depthwise Conv1d whose vLLM param
+            # is 3D [conv_dim, 1, kernel]; the GGUF stores it 2D [conv_dim, kernel].
+            # Insert the singleton channel dim so the mamba loader's slice matches.
+            if hf_name.endswith("conv1d.weight") and weight.ndim == 2:
+                weight = weight.unsqueeze(1)
             if weight.ndim == 3 and ".experts.0." in hf_name:
                 for expert_id, expert_weight in enumerate(weight.unbind()):
                     expert_name = hf_name.replace(
