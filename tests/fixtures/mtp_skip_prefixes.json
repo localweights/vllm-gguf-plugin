@@ -1,0 +1,17 @@
+{
+  "_derivation": "MTP/NextN predict layer(s) = the trailing `nextn_predict_layers` GGUF block(s), i.e. block index >= block_count - nextn_predict_layers = num_hidden_layers. vLLM serves the first num_hidden_layers layers (0..num_hidden_layers-1) with no MTP (spec non-goal: no speculative decoding). The trailing block carries the NextN head tensors (blk.N.nextn.{eh_proj,enorm,hnorm,shared_head_norm} per llama.cpp PR #22673) PLUS a full attn+ffn sublayer — the entire block belongs to the MTP predictor and is skipped for the serving path. Files stay pristine (skip, never strip) so the llama.cpp MTP lane keeps working. Every skipped tensor is verified below to map to NO Qwen3_5 serving-layer param (block index out of range). Chair-derived + hand-reviewed against committed inventories tests/fixtures/qwen36_{27b,35b}_inventory.json on 2026-07-13.",
+  "qwen35": {
+    "block_count": 65,
+    "nextn_predict_layers": 1,
+    "num_hidden_layers": 64,
+    "skip_block_prefixes": ["blk.64."],
+    "expected_skip_count": 15
+  },
+  "qwen35moe": {
+    "block_count": 41,
+    "nextn_predict_layers": 1,
+    "num_hidden_layers": 40,
+    "skip_block_prefixes": ["blk.40."],
+    "expected_skip_count": 20
+  }
+}
