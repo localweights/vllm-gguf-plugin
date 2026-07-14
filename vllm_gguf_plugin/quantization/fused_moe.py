@@ -43,6 +43,15 @@ def _fused_moe_gguf(
 ) -> torch.Tensor:
     activation_enum = MoEActivation.from_str(activation)
 
+    # The CUDA moe kernels index raw data_ptrs and assume contiguous inputs
+    # with int32 expert ids. Under torch.compile / cudagraphs the incoming
+    # activations and topk tensors may be non-contiguous views or int64 —
+    # feeding those to the kernels reads out-of-bounds (illegal memory
+    # access). Normalize here; no-ops when already contiguous int32.
+    x = x.contiguous()
+    topk_ids = topk_ids.to(dtype=torch.int32).contiguous()
+    topk_weights = topk_weights.contiguous()
+
     def act(inp: torch.Tensor):
         d = inp.shape[-1] // 2
         output_shape = inp.shape[:-1] + (d,)

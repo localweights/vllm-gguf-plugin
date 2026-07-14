@@ -34,6 +34,9 @@ from .utils import (
 def _fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
+    # CUDA kernels below index raw data_ptrs and assume a contiguous x
+    # (see fused_moe.py — non-contiguous compiled-graph views caused OOB).
+    x = x.contiguous()
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:

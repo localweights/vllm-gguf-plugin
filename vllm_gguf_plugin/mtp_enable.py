@@ -81,9 +81,32 @@ def install() -> None:
         def build_name_map(self, model_config):
             hf = model_config.hf_config
             if getattr(hf, "model_type", None) == "qwen3_5_mtp":
-                L = hf.get_text_config().num_hidden_layers  # MTP block index
+                text_cfg = hf.get_text_config()
+                L = text_cfg.num_hidden_layers  # MTP block index
                 b = f"blk.{L}"
-                return {
+                if getattr(text_cfg, "num_experts", 0):
+                    # MoE MTP layer (e.g. Qwen3.6-35B-A3B): router + fused
+                    # routed experts (3D ffn_*_exps, consumed whole by the
+                    # GGUFMoEMethod weight_loader via the experts.0.*
+                    # convention, same as the target model) + shared expert
+                    # and its gate.
+                    mlp = {
+                        f"{b}.ffn_gate_inp.weight": "mtp.layers.0.mlp.gate.weight",
+                        f"{b}.ffn_gate_inp_shexp.weight": "mtp.layers.0.mlp.shared_expert_gate.weight",
+                        f"{b}.ffn_gate_shexp.weight": "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+                        f"{b}.ffn_up_shexp.weight": "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+                        f"{b}.ffn_down_shexp.weight": "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+                        f"{b}.ffn_gate_exps.weight": "mtp.layers.0.mlp.experts.0.gate_proj.weight",
+                        f"{b}.ffn_up_exps.weight": "mtp.layers.0.mlp.experts.0.up_proj.weight",
+                        f"{b}.ffn_down_exps.weight": "mtp.layers.0.mlp.experts.0.down_proj.weight",
+                    }
+                else:
+                    mlp = {
+                        f"{b}.ffn_gate.weight": "mtp.layers.0.mlp.gate_proj.weight",
+                        f"{b}.ffn_up.weight": "mtp.layers.0.mlp.up_proj.weight",
+                        f"{b}.ffn_down.weight": "mtp.layers.0.mlp.down_proj.weight",
+                    }
+                return mlp | {
                     f"{b}.nextn.eh_proj.weight": "mtp.fc.weight",
                     f"{b}.nextn.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
                     f"{b}.nextn.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
@@ -96,9 +119,6 @@ def install() -> None:
                     f"{b}.attn_output.weight": "mtp.layers.0.self_attn.o_proj.weight",
                     f"{b}.attn_q_norm.weight": "mtp.layers.0.self_attn.q_norm.weight",
                     f"{b}.attn_k_norm.weight": "mtp.layers.0.self_attn.k_norm.weight",
-                    f"{b}.ffn_gate.weight": "mtp.layers.0.mlp.gate_proj.weight",
-                    f"{b}.ffn_up.weight": "mtp.layers.0.mlp.up_proj.weight",
-                    f"{b}.ffn_down.weight": "mtp.layers.0.mlp.down_proj.weight",
                     "token_embd.weight": "mtp.embed_tokens.weight",
                     "output.weight": "lm_head.weight",
                 }
