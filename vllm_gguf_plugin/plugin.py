@@ -130,3 +130,7 @@ def register() -> None:
     from .mtp_enable import install as _install_mtp
 
     _install_mtp()
+
+    from .mtp_dynamic_skip import install as _install_mtp_dynamic_skip
+
+    _install_mtp_dynamic_skip()
