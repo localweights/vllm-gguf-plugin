@@ -228,6 +228,27 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
+        if model_type == "qwen3_5_moe_text":
+            # Fused expert tensors: gguf ffn_*_exps (3D) -> HF experts.0.*
+            # (map_weights unbinds dim 0 into per-expert names). Router
+            # (ffn_gate_inp) and shared expert (ffn_*_shexp) are covered by
+            # the QWEN35MOE tensor map.
+            for idx in range(config.get_text_config().num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                )
+                sideload_params.append(
+                    regex.compile(
+                        f"model\\.layers\\.{idx}"
+                        r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                    )
+                )
         if model_type == "olmoe":
             for idx in range(config.num_hidden_layers):
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
@@ -470,6 +491,10 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             # Insert the singleton channel dim so the mamba loader's slice matches.
             if hf_name.endswith("conv1d.weight") and weight.ndim == 2:
                 weight = weight.unsqueeze(1)
+            # Qwen3.5-MoE shared_expert_gate is Linear(hidden, 1); llama.cpp
+            # stores the single-row weight squeezed to 1D.
+            if hf_name.endswith("shared_expert_gate.weight") and weight.ndim == 1:
+                weight = weight.unsqueeze(0)
             if weight.ndim == 3 and ".experts.0." in hf_name:
                 for expert_id, expert_weight in enumerate(weight.unbind()):
                     expert_name = hf_name.replace(
