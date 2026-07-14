@@ -180,6 +180,11 @@ class GGUFLinearMethod(LinearMethodBase):
                 end = start + data_container[id_in_container].size(0)
                 size = data_container[id_in_container].size(1)
                 padded_data[start:end, :size] = data_container[id_in_container]
+                # Release this shard's GPU memory immediately after copying.
+                # Owner of the slot: _create_padded_weight_param (this method).
+                # Removed on success: set to None here after copy.
+                # Removed on failure: exception propagates, padded_data discarded.
+                data_container[id_in_container] = None
                 shard_offset_map[idx] = (start, end, size)
                 current_offset = end
             padded_param = GGUFWeightParameter(
