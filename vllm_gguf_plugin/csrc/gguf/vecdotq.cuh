@@ -1751,7 +1751,28 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
 
 static __device__ __forceinline__ void get_int_from_table_16(const uint32_t & q4, const uint8_t * values,
         int & val1, int & val2) {
+#if defined(__CUDA_ARCH__) && !defined(USE_ROCM)
+    // Register-only nibble->value lookup via PRMT (ported from ik_llama.cpp).
+    // Avoids 8 scattered byte loads from device memory per 32-bit word.
+    uint32_t v1, v2, v3, v4, mask;
+    const uint32_t * values32 = (const uint32_t *)values;
 
+    mask = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    // Lookups in the lower half of the table (indices 0-7).
+    v1 = __byte_perm(values32[0], values32[1], q4);
+    // Lookups in the upper half of the table (indices 8-15).
+    v2 = __byte_perm(values32[2], values32[3], q4);
+    // Select low/high result based on the MSB of each index nibble.
+    v3 = __byte_perm(v1, v2, mask);
+    // Same for the upper 16 bits of q4.
+    v1 = __byte_perm(values32[0], values32[1], q4 >> 16);
+    v2 = __byte_perm(values32[2], values32[3], q4 >> 16);
+    v4 = __byte_perm(v1, v2, mask >> 16);
+
+    // Even bytes -> low-nibble values, odd bytes -> high-nibble values.
+    val1 = __byte_perm(v3, v4, 0x6420);
+    val2 = __byte_perm(v3, v4, 0x7531);
+#else
     uint32_t aux32; const uint8_t * q8 = (const uint8_t *)&aux32;
     aux32 = q4 & 0x0f0f0f0f;
     uint16_t v1 = values[q8[0]] | (values[q8[1]] << 8);
@@ -1761,6 +1782,7 @@ static __device__ __forceinline__ void get_int_from_table_16(const uint32_t & q4
     v1 = values[q8[0]] | (values[q8[1]] << 8);
     v2 = values[q8[2]] | (values[q8[3]] << 8);
     val2 = v1 | (v2 << 16);
+#endif
 }
 
 static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
