@@ -129,7 +129,12 @@ def map_qwen35_config(arch: str, meta: dict) -> PretrainedConfig:
         })
 
     config_cls = _CONFIG_CLASS[arch]
-    return config_cls(**cfg_kwargs)
+    config = config_cls(**cfg_kwargs)
+    # Preserve the MTP/nextn layer count so the speculative (MTP) lane can build
+    # a Qwen3_5MTP draft from the baked blk.<num_hidden_layers>.nextn.* head.
+    config.mtp_num_hidden_layers = nextn
+    config.num_nextn_predict_layers = nextn
+    return config
 
 
 # ── monkey-patch registration ────────────────────────────────────────

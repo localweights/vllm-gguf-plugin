@@ -127,3 +127,6 @@ def register() -> None:
     _patch_speculator_probe()
     _patch_diffusers_loader()
     _register_qwen35_gguf()
+    from .mtp_enable import install as _install_mtp
+
+    _install_mtp()
