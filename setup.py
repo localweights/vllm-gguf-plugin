@@ -19,6 +19,10 @@ def _package_version() -> str:
 
 
 def _should_build_extension() -> bool:
+    if os.environ.get("VLLM_GGUF_PLUGIN_SKIP_EXT") == "1":
+        # Reuse a previously built _C_gguf.abi3.so (e.g. when the host nvcc
+        # version mismatches torch's CUDA build and rebuilding is impossible).
+        return False
     packaging_commands = {"sdist", "egg_info", "dist_info"}
     return not any(command in packaging_commands for command in sys.argv[1:])
 
