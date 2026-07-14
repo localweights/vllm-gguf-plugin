@@ -178,13 +178,44 @@ static void mul_mat_vec_q5_1_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
 }
 
+// Shared small-batch dispatch: for nvecs 2..8 use the multi-column dst kernel
+// (each weight block fetched once and reused for all dst columns) instead of
+// the grid-y layout that re-reads the whole weight matrix per column
+// (measured 1.8-2.2x batch-2 cost on q5_K/q6_K decode tensors). Per-column
+// accumulation order matches mul_mat_vec_q exactly -> bitwise-identical.
+// Same treatment 758367d applied to iq4_xs/iq4_nl.
+template<typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+static void mul_mat_vec_q_dispatch_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+    // 2 rows (warps) per block for the ncols kernels: a 1-warp block caps
+    // resident warps/SM at Ampere's 16-blocks/SM limit; 2 warps/block doubles
+    // latency hiding. Launch geometry only -> bitwise-identical results.
+    constexpr int MMV_Y2 = 2;
+    const int block_num_y2 = (nrows + MMV_Y2 - 1) / MMV_Y2;
+    const dim3 block_dims2(WARP_SIZE, MMV_Y2, 1);
+    if (nvecs == 2) {
+        const dim3 block_nums(block_num_y2, 1, 1);
+        mul_mat_vec_q_ncols<scalar_t, qk, qi, block_q_t, vdr, 2, vec_dot_q_cuda>
+            <<<block_nums, block_dims2, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    } else if (nvecs > 2 && nvecs <= 4) {
+        const dim3 block_nums(block_num_y2, 1, 1);
+        mul_mat_vec_q_ncols<scalar_t, qk, qi, block_q_t, vdr, 4, vec_dot_q_cuda>
+            <<<block_nums, block_dims2, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    } else if (nvecs > 4 && nvecs <= 8) {
+        const dim3 block_nums(block_num_y2, 1, 1);
+        mul_mat_vec_q_ncols<scalar_t, qk, qi, block_q_t, vdr, 8, vec_dot_q_cuda>
+            <<<block_nums, block_dims2, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    } else {
+        const dim3 block_nums(block_num_y, nvecs, 1);
+        mul_mat_vec_q<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    }
+}
+
 template<typename scalar_t>
 static void mul_mat_vec_q8_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, nvecs, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    mul_mat_vec_q_dispatch_cuda<scalar_t, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template<typename scalar_t>
@@ -216,20 +247,12 @@ static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_
 
 template<typename scalar_t>
 static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, nvecs, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    mul_mat_vec_q_dispatch_cuda<scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template<typename scalar_t>
 static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, nvecs, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    mul_mat_vec_q_dispatch_cuda<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template<typename scalar_t>
@@ -314,9 +337,24 @@ static void mul_mat_vec_iq4_xs_q8_1_cuda(const void * vx, const void * vy, scala
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
     if (nvecs == 2) {
-        const dim3 block_nums(block_num_y, 1, 1);
+        // The fused 2-col kernel is a single-warp-per-block launch
+        // (GGML_CUDA_MMV_Y == 1), which hard-caps resident warps/SM at the
+        // Ampere 16-blocks/SM limit (16 warps/SM out of 48 max) regardless
+        // of register headroom (measured 40 regs/thread, well under the
+        // budget for 16 blocks/SM). For shapes with a large K-dim (many
+        // sequential, dependent global-load iterations per warp, e.g.
+        // ffn_down 5120x17408 -> 68 blocks_per_row) that low warp count
+        // starves latency hiding and the batch-2 cost balloons (measured
+        // 1.35x vs 1.06x for ffn_gate/up's 20 blocks_per_row). Packing
+        // MMV_Y2=2 rows/block doubles resident warps/SM (32/48) for a pure
+        // launch-geometry change -- no change to vec_dot math, so results
+        // stay bitwise-identical.
+        constexpr int MMV_Y2 = 2;
+        const int block_num_y2 = (nrows + MMV_Y2 - 1) / MMV_Y2;
+        const dim3 block_dims2(WARP_SIZE, MMV_Y2, 1);
+        const dim3 block_nums(block_num_y2, 1, 1);
         mul_mat_vec_iq4_xs_q8_1_2col<scalar_t>
-            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
+            <<<block_nums, block_dims2, 0, stream>>>(vx, vy, dst, ncols, nrows);
     } else if (nvecs > 2 && nvecs <= 4) {
         const dim3 block_nums(block_num_y, 1, 1);
         mul_mat_vec_q_ncols<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, 4, vec_dot_iq4_xs_q8_1>
