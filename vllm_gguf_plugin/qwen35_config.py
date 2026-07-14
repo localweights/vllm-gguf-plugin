@@ -164,9 +164,13 @@ def _register_qwen35_causallm() -> None:
     GGUF serve of this VL model must use the CausalLM class instead.
     """
     from vllm import ModelRegistry
+
+    # Register the plugin's hybrid-flagged subclasses (see qwen35_models.py —
+    # the flag must live on the class in its home module because vLLM
+    # inspects model classes in a fresh subprocess).
     for arch, path in (
-        ("Qwen3_5ForCausalLM", "vllm.model_executor.models.qwen3_5:Qwen3_5ForCausalLM"),
-        ("Qwen3_5MoeForCausalLM", "vllm.model_executor.models.qwen3_5:Qwen3_5MoeForCausalLM"),
+        ("Qwen3_5ForCausalLM", "vllm_gguf_plugin.qwen35_models:Qwen3_5ForCausalLM"),
+        ("Qwen3_5MoeForCausalLM", "vllm_gguf_plugin.qwen35_models:Qwen3_5MoeForCausalLM"),
     ):
         if arch not in ModelRegistry.get_supported_archs():
             ModelRegistry.register_model(arch, path)

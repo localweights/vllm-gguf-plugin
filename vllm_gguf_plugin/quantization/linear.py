@@ -56,8 +56,23 @@ def _fused_mul_mat_gguf(
                 f"x={tuple(x.shape)}",
                 flush=True,
             )
-        weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
-        y = x @ weight.T
+        # Chunk the dequant fallback along output rows: a full dequant of a
+        # large layer (e.g. 34816x5120 bf16 = ~340 MB) as one transient OOMs
+        # small cards during CUDA-graph capture. 8192-row chunks cap the
+        # transient at ~80 MB with negligible overhead.
+        _CHUNK = 4096
+        if shape[0] > _CHUNK:
+            outs = []
+            for i in range(0, shape[0], _CHUNK):
+                rows = min(_CHUNK, shape[0] - i)
+                wchunk = ops.ggml_dequantize(
+                    qweight.narrow(0, i, rows), qweight_type, rows, shape[1], x.dtype
+                )
+                outs.append(x @ wchunk.T)
+            y = torch.cat(outs, dim=-1)
+        else:
+            weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+            y = x @ weight.T
     else:
         qweight_type = WeightType(qweight_type)
         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
