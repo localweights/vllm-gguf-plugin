@@ -23,6 +23,23 @@ from .weights_adapter import get_weights_adapter
 logger = init_logger(__name__)
 
 
+def _mem_debug_iterator(weights):
+    """Log cumulative CUDA memory per yielded tensor (VLLM_GGUF_MEM_DEBUG=1)."""
+    count = 0
+    last = 0.0
+    for name, tensor in weights:
+        count += 1
+        alloc = torch.cuda.memory_allocated() / 2**30
+        if count % 50 == 0 or alloc - last > 0.3 or tensor.numel() > 50_000_000:
+            print(
+                f"MEM-DEBUG #{count} {name} shape={tuple(tensor.shape)} "
+                f"allocated={alloc:.2f} GiB (+{alloc - last:.2f})",
+                flush=True,
+            )
+            last = alloc
+        yield name, tensor
+
+
 class GGUFModelLoader(BaseModelLoader):
     """
     Model loader that can load GGUF files. This is useful for loading models
@@ -77,7 +94,15 @@ class GGUFModelLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         adapter = self._prepare_adapter(model_config)
-        model.load_weights(adapter.prepare_weights(model_config))
+        weights = adapter.prepare_weights(model_config)
+        if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
+            weights = _mem_debug_iterator(weights)
+        model.load_weights(weights)
+        if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
+            print(
+                f"MEM-DEBUG post-load_weights allocated={torch.cuda.memory_allocated() / 2**30:.2f} GiB",
+                flush=True,
+            )
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
@@ -97,8 +122,19 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
-            model.load_weights(
-                adapter.prepare_weights(model_config),
-            )
+            weights = adapter.prepare_weights(model_config)
+            if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
+                weights = _mem_debug_iterator(weights)
+            model.load_weights(weights)
+            if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
+                logger.info(
+                    "MEM-DEBUG pre-process_weights allocated=%.2f GiB",
+                    torch.cuda.memory_allocated() / 2**30,
+                )
             process_weights_after_loading(model, model_config, target_device)
+            if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
+                logger.info(
+                    "MEM-DEBUG post-process_weights allocated=%.2f GiB",
+                    torch.cuda.memory_allocated() / 2**30,
+                )
         return model

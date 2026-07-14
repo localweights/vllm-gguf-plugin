@@ -100,6 +100,14 @@ def _store_gguf_weight_type(
     loaded_weight: torch.Tensor,
     shard_id: int | str | None = None,
 ) -> None:
+    if isinstance(shard_id, (tuple, list)):
+        # A fused checkpoint tensor covering several shards of a merged param
+        # (e.g. Qwen3.5 GDN in_proj_qkv -> in_proj_qkvz shards (0, 1, 2))
+        # arrives with a composite shard id. Record its quant type under each
+        # member id — apply() looks types up per shard.
+        for sid in shard_id:
+            _store_gguf_weight_type(param, loaded_weight, sid)
+        return
     loaded_weight = _clone_loaded_weight(loaded_weight).to(
         device=param.device, dtype=torch.uint8
     )
@@ -357,6 +365,12 @@ def _materialize_gguf_weight_parameter(
     qweight.shard_id_map = dict(raw_param.shard_id_map)
     if hasattr(raw_param, "ignore_warning"):
         qweight.ignore_warning = raw_param.ignore_warning
+    # Transfer ownership: the replaced parameter can outlive register_parameter
+    # (loader-side references keep it alive), and its data_container would pin
+    # every GPU shard — observed as a full extra copy of all merged-layer
+    # weights (~9 GiB on Qwen3.6-27B). Strip its tensor references so shards
+    # actually free when the new parameter releases them.
+    raw_param.data_container.clear()
     layer.register_parameter(param_name, qweight)
 
 

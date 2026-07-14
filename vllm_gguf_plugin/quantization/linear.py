@@ -49,6 +49,13 @@ def _fused_mul_mat_gguf(
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+        if shape[1] != x.shape[1]:
+            print(
+                f"MEM-DEBUG dequant-mismatch wtype={qweight_type} "
+                f"qweight={tuple(qweight.shape)} dequant_shape={shape} "
+                f"x={tuple(x.shape)}",
+                flush=True,
+            )
         weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
         y = x @ weight.T
     else:
@@ -136,6 +143,11 @@ class GGUFLinearMethod(LinearMethodBase):
         layer.register_parameter("qweight_type", qweight_type)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        import os
+
+        _dbg = os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1"
+        if _dbg:
+            _before = torch.cuda.memory_allocated() / 2**30
         self._materialize_gguf_parameters(layer)
         qweight_type = layer.qweight_type.weight_type
         if not (qweight_type in UNQUANTIZED_TYPES or qweight_type in DEQUANT_TYPES):
@@ -144,6 +156,26 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
             )
         self._create_padded_weight_param(layer)
+        if _dbg:
+            _after = torch.cuda.memory_allocated() / 2**30
+            if tuple(layer.qweight.shape) == (16384, 3520) and not getattr(
+                type(self), "_dbg_qkvz_printed", False
+            ):
+                type(self)._dbg_qkvz_printed = True
+                print(
+                    f"MEM-DEBUG qkvz-layer shard_id={layer.qweight.shard_id} "
+                    f"types={layer.qweight_type.shard_weight_type} "
+                    f"wtype={layer.qweight_type.weight_type} "
+                    f"map={getattr(layer.qweight, 'shard_offset_map', None)}",
+                    flush=True,
+                )
+            if _after - _before > 0.05:
+                print(
+                    f"MEM-DEBUG process_weights {type(layer).__name__} "
+                    f"qshape={tuple(layer.qweight.shape)} {_before:.2f}->{_after:.2f} GiB "
+                    f"(+{_after - _before:.2f})",
+                    flush=True,
+                )
 
     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
         self._materialize_qweight(layer)
@@ -184,7 +216,20 @@ class GGUFLinearMethod(LinearMethodBase):
                 # Owner of the slot: _create_padded_weight_param (this method).
                 # Removed on success: set to None here after copy.
                 # Removed on failure: exception propagates, padded_data discarded.
+                shard_nbytes = data_container[id_in_container].nbytes
+                shard_refs = None
+                import os as _os
+                if _os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
+                    import sys as _sys
+                    shard_refs = _sys.getrefcount(data_container[id_in_container])
                 data_container[id_in_container] = None
+                if shard_refs is not None:
+                    print(
+                        f"MEM-DEBUG shard-free idx={idx} bytes={shard_nbytes} "
+                        f"refs-before-free={shard_refs} "
+                        f"alloc={torch.cuda.memory_allocated() / 2**30:.3f} GiB",
+                        flush=True,
+                    )
                 shard_offset_map[idx] = (start, end, size)
                 current_offset = end
             padded_param = GGUFWeightParameter(
@@ -226,7 +271,15 @@ class GGUFLinearMethod(LinearMethodBase):
                 layer.qweight_type.shard_weight_type.get(idx, fallback_wtype)
                 for idx in shard_id
             ]
-            if len(set(shard_weight_types)) == 1:
+            offset_map = getattr(layer.qweight, "shard_offset_map", None)
+            unpadded = offset_map is None or all(
+                offset_map[idx][2] == qweight.shape[1] for idx in shard_id
+            )
+            # Whole-tensor fast path is only valid when every shard shares one
+            # quant type AND none was width-padded — dequantizing a padded row
+            # at a single type yields the wrong logical width (e.g. 6400 vs
+            # 5120 on mixed-quant merged in_proj).
+            if len(set(shard_weight_types)) == 1 and unpadded:
                 out = fused_mul_mat_gguf_op(x, qweight, shard_weight_types[0])
                 if bias is not None:
                     out.add_(bias)
@@ -237,11 +290,22 @@ class GGUFLinearMethod(LinearMethodBase):
                 qweight_type = layer.qweight_type.shard_weight_type.get(
                     idx, fallback_wtype
                 )
-                result.append(
-                    fused_mul_mat_gguf_op(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
+                try:
+                    result.append(
+                        fused_mul_mat_gguf_op(
+                            x, qweight[start:end, :offset].contiguous(), qweight_type
+                        )
                     )
-                )
+                except RuntimeError:
+                    print(
+                        f"MEM-DEBUG apply-fail shard={idx} start={start} end={end} "
+                        f"offset={offset} wtype={qweight_type} "
+                        f"types={layer.qweight_type.shard_weight_type} "
+                        f"fallback={fallback_wtype} qshape={tuple(qweight.shape)} "
+                        f"x={tuple(x.shape)} map={layer.qweight.shard_offset_map}",
+                        flush=True,
+                    )
+                    raise
             out = torch.cat(result, axis=1)
         else:
             qweight = layer.qweight
