@@ -35,11 +35,136 @@ _QWEN35_ARCH_MAP: dict[str, gguf.MODEL_ARCH] = {
     "qwen3_5_moe_text": gguf.MODEL_ARCH.QWEN35MOE,
 }
 
+# ── GDN layout fixup helpers (undo llama.cpp transforms at load) ───────
+
+
+def _inverse_reorder_v_heads(
+    tensor: torch.Tensor,
+    dim: int,
+    num_k_heads: int,
+    num_v_per_k: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Inverse of llama.cpp's _reorder_v_heads: tiled → grouped.
+
+    llama.cpp forward: reshape dim into (K, v_per_k, hd), swap → (v_per_k, K, hd).
+    Inverse: reshape dim into (v_per_k, K, hd), swap → (K, v_per_k, hd), flatten.
+    """
+    shape = list(tensor.shape)
+    if dim < 0:
+        dim += len(shape)
+    new_shape = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1:]
+    tensor = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return tensor.permute(*perm).contiguous().reshape(*shape)
+
+
+def _needs_norm_minus_one(hf_name: str) -> bool:
+    """Return True if the norm weight had +1 applied by llama.cpp converter.
+
+    ALL norm weights EXCEPT linear_attn.norm (ssm_norm) got +1.
+    """
+    if not hf_name.endswith(".weight"):
+        return False
+    base = hf_name.removesuffix(".weight")
+    # Exclude linear_attn.norm (ssm_norm) — chair verified it matches raw
+    if base.endswith(".linear_attn.norm"):
+        return False
+    # Match any norm weight: input_layernorm, post_attention_layernorm,
+    # q_norm, k_norm, final model norm, mtp norms.
+    # Use substring "norm" (not ".norm") — names like input_layernorm,
+    # q_norm, k_norm have the norm suffix without a preceding dot.
+    if "norm" in base and not base.endswith(".linear_attn.norm"):
+        return True
+    return False
+
+
+def _apply_norm_minus_one(weight: torch.Tensor, hf_name: str) -> torch.Tensor:
+    """Subtract 1.0 from norm weights that had +1 applied (F32 only)."""
+    if _needs_norm_minus_one(hf_name):
+        return weight.sub(1.0)
+    return weight
+
+
+def _apply_gdn_row_fixup(
+    weight: torch.Tensor,
+    suffix: str,
+    num_k_heads: int,
+    num_v_heads: int,
+    v_per_k: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Apply inverse V-head reorder to a GDN weight tensor.
+
+    For in_proj_qkv: only the V rows are permuted (q/k rows untouched).
+    For in_proj_z / in_proj_a / in_proj_b: all rows are permuted.
+
+    Row operations are quant-safe: whole rows (quant blocks) are moved as units.
+    """
+    if suffix == "in_proj_qkv":
+        q_dim = num_k_heads * head_dim
+        k_dim = num_k_heads * head_dim
+        v_start = q_dim + k_dim
+        q = weight[:q_dim]
+        k = weight[q_dim:v_start]
+        v = _inverse_reorder_v_heads(
+            weight[v_start:], 0, num_k_heads, v_per_k, head_dim
+        )
+        return torch.cat([q, k, v], dim=0)
+    else:
+        # in_proj_z, in_proj_a, in_proj_b: permute all rows
+        return _inverse_reorder_v_heads(weight, 0, num_k_heads, v_per_k, head_dim)
+
+
+def _apply_gdn_1d_fixup(
+    weight: torch.Tensor,
+    num_k_heads: int,
+    v_per_k: int,
+) -> torch.Tensor:
+    """Apply inverse reorder to 1D GDN tensors (dt_bias, A_log).
+
+    Expand to 2D for reshape, apply inverse reorder, squeeze back.
+    """
+    if weight.ndim == 1:
+        w = weight.unsqueeze(-1)
+        w = _inverse_reorder_v_heads(w, 0, num_k_heads, v_per_k, 1)
+        return w.squeeze(-1)
+    return weight
+
+
+def _compute_out_proj_col_perm(
+    num_k_heads: int, num_v_heads: int, v_per_k: int, head_dim: int,
+) -> torch.Tensor:
+    """Compute the column permutation for out_proj.
+
+    The GGUF stores out_proj columns in tiled (ggml broadcast) order.
+    This perm maps HF activation order → GGUF column order so that
+    x.index_select(-1, perm) aligns activations with weight columns.
+
+    This is the FORWARD _reorder_v_heads applied to arange(V*hd) along dim=1,
+    because the GGUF weight columns are in the tiled (forward-reordered) order.
+    """
+    # Forward: reshape (K, v_per_k, hd), swap axes → (v_per_k, K, hd), flatten
+    t = torch.arange(num_v_heads * head_dim, dtype=torch.long).reshape(
+        num_k_heads, v_per_k, head_dim
+    )
+    t = t.permute(1, 0, 2).contiguous().reshape(-1)
+    return t
+
 
 class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
     """Default adapter for GGUF models."""
 
     load_spec = None
+
+    # GDN fixup params (set during prepare_loading for QWEN35/QWEN35MOE)
+    _gdn_k_heads: int = 0
+    _gdn_v_heads: int = 0
+    _gdn_v_per_k: int = 0
+    _gdn_head_dim: int = 0
+    _gdn_out_proj_perm: torch.Tensor | None = None
+    _has_gdn: bool = False
 
     @classmethod
     def matches(cls, config) -> bool:
@@ -269,6 +394,71 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
             )
         return gguf_to_hf_name_map
 
+    def transform_weight(
+        self, hf_name: str, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply model-specific weight transforms (GDN fixups for Qwen3.6)."""
+        if not self._has_gdn:
+            return weight
+
+        k = self._gdn_k_heads
+        v = self._gdn_v_heads
+        vpk = self._gdn_v_per_k
+        hd = self._gdn_head_dim
+
+        # Quantized tensors arrive with a ".qweight" suffix; row permutations
+        # are quant-safe (whole byte-rows move as units), so match both.
+        # The scalar ".qweight_type" companions must never be touched.
+        if hf_name.endswith(".qweight_type"):
+            return weight
+        base = hf_name.removesuffix(".qweight") if hf_name.endswith(".qweight") \
+            else hf_name.removesuffix(".weight") if hf_name.endswith(".weight") \
+            else hf_name
+
+        # 1. in_proj_qkv — V rows only, hd=128
+        if base.endswith(".in_proj_qkv"):
+            weight = _apply_gdn_row_fixup(weight, "in_proj_qkv", k, v, vpk, hd)
+
+        # 2. in_proj_z — all rows, hd=128
+        elif base.endswith(".in_proj_z"):
+            weight = _apply_gdn_row_fixup(weight, "in_proj_z", k, v, vpk, hd)
+
+        # 3. in_proj_a / in_proj_b — rows, hd=1
+        elif base.endswith(".in_proj_a") or base.endswith(".in_proj_b"):
+            weight = _apply_gdn_row_fixup(weight, "in_proj_a", k, v, vpk, 1)
+
+        # 4. dt_bias (1D V, hd=1)
+        elif hf_name.endswith(".dt_bias"):
+            weight = _apply_gdn_1d_fixup(weight, k, vpk)
+
+        # 5. A_log: FIRST inverse-reorder (1D V, hd=1), THEN log(-a) (F32)
+        elif hf_name.endswith(".A_log"):
+            weight = _apply_gdn_1d_fixup(weight, k, vpk)
+            # llama.cpp stored a = -exp(A_log), so A_log = log(-a)
+            weight = torch.log(-weight)
+
+        # 6. conv1d.weight — V channel block only, hd=128
+        # (applied BEFORE unsqueeze in map_weights, see below)
+        elif hf_name.endswith(".conv1d.weight"):
+            qk_channels = k * hd * 2  # q+k channels
+            v_start = qk_channels
+            qk = weight[:v_start, :]
+            v_part = _inverse_reorder_v_heads(
+                weight[v_start:, :], 0, k, vpk, hd
+            )
+            weight = torch.cat([qk, v_part], dim=0)
+
+        # 7. out_proj.weight — columns are permuted. We DON'T permute here
+        # (quant-unsafe). Instead, we register gguf_input_col_perm on the layer
+        # and do the perm at runtime in GGUFLinearMethod.apply().
+        # No transform needed here.
+
+        # 8. norm.weight — subtract 1.0 for non-linear_attn norms
+        elif hf_name.endswith(".weight"):
+            weight = _apply_norm_minus_one(weight, hf_name)
+
+        return weight
+
     def map_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -370,6 +560,26 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                 text_config.num_hidden_layers,
                 arch_str,
             )
+
+            # Extract GDN params for fixups
+            k_heads = getattr(text_config, "linear_num_key_heads", 0)
+            v_heads = getattr(text_config, "linear_num_value_heads", 0)
+            head_dim = getattr(text_config, "linear_key_head_dim", 0)
+
+            if k_heads > 0 and v_heads > 0 and k_heads != v_heads:
+                v_per_k = v_heads // k_heads
+                self._has_gdn = True
+                self._gdn_k_heads = k_heads
+                self._gdn_v_heads = v_heads
+                self._gdn_v_per_k = v_per_k
+                self._gdn_head_dim = head_dim
+                self._gdn_out_proj_perm = _compute_out_proj_col_perm(
+                    k_heads, v_heads, v_per_k, head_dim
+                )
+                logger.info(
+                    "GDN fixups enabled: K=%d V=%d v_per_k=%d hd=%d",
+                    k_heads, v_heads, v_per_k, head_dim,
+                )
 
         self.update_tie_word_embeddings(
             model_path, model_config.hf_config, gguf_to_hf_name_map

@@ -277,6 +277,16 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 
+        # GDN out_proj column permutation: GGUF weight columns are in tiled
+        # (ggml broadcast) order. Permute activations from grouped → tiled
+        # order before the matmul. This is an activation-side gather (cheap)
+        # rather than a column perm on the quantized weight (impossible).
+        # The perm tensor is registered as gguf_input_col_perm on the layer
+        # by the loader post-load hook.
+        perm = getattr(layer, "gguf_input_col_perm", None)
+        if perm is not None:
+            x = x.index_select(-1, perm)
+
         shard_id = layer.qweight.shard_id
         if shard_id:
             shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id

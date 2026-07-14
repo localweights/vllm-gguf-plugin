@@ -23,6 +23,30 @@ from .weights_adapter import get_weights_adapter
 logger = init_logger(__name__)
 
 
+def _register_gdn_out_proj_perm(model: nn.Module, adapter) -> None:
+    """Attach the GDN out_proj input-column permutation to each out_proj layer.
+
+    The GGUF stores out_proj with columns in llama.cpp's tiled V-head order; a
+    column permutation of the quantized weight is impossible (quant blocks are
+    wider than a head), so GGUFLinearMethod.apply() gathers the activation
+    columns instead — it reads `gguf_input_col_perm` off the layer.
+    """
+    perm = getattr(adapter, "_gdn_out_proj_perm", None)
+    if perm is None:
+        return
+    count = 0
+    for name, module in model.named_modules():
+        if name.endswith("linear_attn.out_proj"):
+            device = next(
+                (p.device for p in module.parameters(recurse=False)), None
+            )
+            module.gguf_input_col_perm = perm.to(
+                device=device if device is not None else "cpu"
+            )
+            count += 1
+    logger.info("Registered gguf_input_col_perm on %d out_proj layers", count)
+
+
 def _mem_debug_iterator(weights):
     """Log cumulative CUDA memory per yielded tensor (VLLM_GGUF_MEM_DEBUG=1)."""
     count = 0
@@ -98,6 +122,7 @@ class GGUFModelLoader(BaseModelLoader):
         if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
             weights = _mem_debug_iterator(weights)
         model.load_weights(weights)
+        _register_gdn_out_proj_perm(model, adapter)
         if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
             print(
                 f"MEM-DEBUG post-load_weights allocated={torch.cuda.memory_allocated() / 2**30:.2f} GiB",
@@ -126,6 +151,7 @@ class GGUFModelLoader(BaseModelLoader):
             if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
                 weights = _mem_debug_iterator(weights)
             model.load_weights(weights)
+            _register_gdn_out_proj_perm(model, adapter)
             if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
                 logger.info(
                     "MEM-DEBUG pre-process_weights allocated=%.2f GiB",
