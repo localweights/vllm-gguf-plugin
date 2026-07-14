@@ -1820,8 +1820,20 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const int ib32 = iqs;
     const int32_t  * q8 = (const int *)bq8_1[ib32].qs;
     const uint32_t * q4 = (const uint32_t *)bq4->qs + 4*ib32;
-    const int8_t ls = ((bq4->scales_l[ib32/2] >> 4*(ib32%2)) & 0xf) | (((bq4->scales_h >> 2*ib32) & 3) << 4);
-    const float d = __half2float(bq4->d) * (ls - 32) * __low2float(bq8_1[ib32].ds);
+
+    // Header (d: half[2B] + scales_h: uint16[2B] + scales_l[4B] = 8B) is laid out
+    // contiguously at the front of block_iq4_xs (verified: sizeof == 136, 8-aligned
+    // per block, so this cast is safe/aligned for all block indices). Load it as a
+    // single 64-bit word instead of 3 scattered loads (d, scales_l[ib32/2], scales_h)
+    // per ib32 call.
+    const uint64_t header = *(const uint64_t * __restrict__)bq4;
+    const half   d_h      = __ushort_as_half((unsigned short)(header & 0xFFFFULL));
+    const uint16_t scales_h = (uint16_t)((header >> 16) & 0xFFFFULL);
+    const uint32_t scales_l_word = (uint32_t)(header >> 32);
+    const uint8_t  scales_l_byte = (uint8_t)((scales_l_word >> (8 * (ib32 / 2))) & 0xFFU);
+
+    const int8_t ls = ((scales_l_byte >> 4*(ib32%2)) & 0xf) | (((scales_h >> 2*ib32) & 3) << 4);
+    const float d = __half2float(d_h) * (ls - 32) * __low2float(bq8_1[ib32].ds);
     int v1, v2;
     int sumi1 = 0, sumi2 = 0;
     for (int j = 0; j < 4; ++j) {
