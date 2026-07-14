@@ -1844,3 +1844,45 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     return d * (sumi1 + sumi2);
 #endif
 }
+
+// 2-column fused variant: decodes the iq4_xs weights (q4 loads + PRMT nibble
+// lookup + header/scale extraction) ONCE and dots them against two q8_1
+// activation columns. Per-column math is identical to vec_dot_iq4_xs_q8_1
+// (same op order/association), so results are bitwise-identical; only the
+// redundant weight decode is eliminated. Used by the MTP verify batch=2 path.
+static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_2col(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1_c0,
+    const block_q8_1 * __restrict__ bq8_1_c1, const int & iqs,
+    float & r0, float & r1) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq;
+    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
+
+    const int ib32 = iqs;
+    const int32_t  * q8a = (const int *)bq8_1_c0[ib32].qs;
+    const int32_t  * q8b = (const int *)bq8_1_c1[ib32].qs;
+    const uint32_t * q4 = (const uint32_t *)bq4->qs + 4*ib32;
+
+    const uint64_t header = *(const uint64_t * __restrict__)bq4;
+    const half   d_h      = __ushort_as_half((unsigned short)(header & 0xFFFFULL));
+    const uint16_t scales_h = (uint16_t)((header >> 16) & 0xFFFFULL);
+    const uint32_t scales_l_word = (uint32_t)(header >> 32);
+    const uint8_t  scales_l_byte = (uint8_t)((scales_l_word >> (8 * (ib32 / 2))) & 0xFFU);
+
+    const int8_t ls = ((scales_l_byte >> 4*(ib32%2)) & 0xf) | (((scales_h >> 2*ib32) & 3) << 4);
+    const float da = __half2float(d_h) * (ls - 32) * __low2float(bq8_1_c0[ib32].ds);
+    const float db = __half2float(d_h) * (ls - 32) * __low2float(bq8_1_c1[ib32].ds);
+    int v1, v2;
+    int sumi1a = 0, sumi2a = 0, sumi1b = 0, sumi2b = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        get_int_from_table_16(q4[j], values, v1, v2);
+        sumi1a = __dp4a(v1, q8a[j+0], sumi1a);
+        sumi2a = __dp4a(v2, q8a[j+4], sumi2a);
+        sumi1b = __dp4a(v1, q8b[j+0], sumi1b);
+        sumi2b = __dp4a(v2, q8b[j+4], sumi2b);
+    }
+    r0 += da * (sumi1a + sumi2a);
+    r1 += db * (sumi1b + sumi2b);
+#endif
+}

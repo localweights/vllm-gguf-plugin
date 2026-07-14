@@ -40,6 +40,108 @@ static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * 
     }
 }
 
+// Multi-column variant: one thread accumulates ALL dst columns for its row so
+// each weight (x) block is fetched from DRAM once and reused from L1 for the
+// remaining columns. The per-column accumulation order is identical to
+// mul_mat_vec_q, so results are bitwise-identical. Used for small batch
+// (MTP verify runs the target model over 2 tokens/step; the 1-col grid-y
+// layout re-reads the full weight matrix per column -> ~2x kernel time).
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, int ncols_dst, vec_dot_q_cuda_t vec_dot_q_cuda>
+static __global__ void mul_mat_vec_q_ncols(const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows, const int nvecs) {
+    const auto row = blockIdx.x*blockDim.y + threadIdx.y;
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+
+    float tmp[ncols_dst];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j] = 0.0f;
+    }
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (auto i = threadIdx.x / (qi/vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iqs  = vdr * (threadIdx.x % (qi/vdr)); // x block quant index when casting the quants to int
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            if (j < nvecs) {
+                const int iby = j*(nrows_y/QK8_1) + i * (qk/QK8_1); // y block index that aligns with ibx
+                tmp[j] += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+            }
+        }
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+            tmp[j] += VLLM_SHFL_XOR_SYNC(tmp[j], mask);
+        }
+        if (threadIdx.x == 0 && j < nvecs) {
+            dst[j*nrows + row] = tmp[j];
+        }
+    }
+}
+
+// Dedicated iq4_xs 2-column kernel using the fused 2-col vec dot: the weight
+// block is decoded once per (thread, block) and dotted against both activation
+// columns from registers. Bitwise-identical per-column math.
+template <typename scalar_t>
+static __global__ void mul_mat_vec_iq4_xs_q8_1_2col(const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows) {
+    constexpr int qk = QK_K;
+    constexpr int qi = QI4_XS;
+    constexpr int vdr = 1;
+
+    const auto row = blockIdx.x*blockDim.y + threadIdx.y;
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+
+    float tmp0 = 0.0f;
+    float tmp1 = 0.0f;
+
+    const block_iq4_xs * x = (const block_iq4_xs *) vx;
+    const block_q8_1   * y = (const block_q8_1 *) vy;
+
+    for (auto i = threadIdx.x / (qi/vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index (col 0) that aligns with ibx
+
+        const int iqs  = vdr * (threadIdx.x % (qi/vdr));
+
+        vec_dot_iq4_xs_q8_1_2col(&x[ibx], &y[iby], &y[(nrows_y/QK8_1) + iby], iqs, tmp0, tmp1);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+        tmp0 += VLLM_SHFL_XOR_SYNC(tmp0, mask);
+        tmp1 += VLLM_SHFL_XOR_SYNC(tmp1, mask);
+    }
+
+    if (threadIdx.x == 0) {
+        dst[row] = tmp0;
+        dst[nrows + row] = tmp1;
+    }
+}
+
 template<typename scalar_t>
 static void mul_mat_vec_q4_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
@@ -187,19 +289,47 @@ static void mul_mat_vec_iq1_m_q8_1_cuda(const void * vx, const void * vy, scalar
 template<typename scalar_t>
 static void mul_mat_vec_iq4_nl_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, nvecs, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    if (nvecs == 2) {
+        const dim3 block_nums(block_num_y, 1, 1);
+        mul_mat_vec_q_ncols<scalar_t, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, 2, vec_dot_iq4_nl_q8_1>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    } else if (nvecs > 2 && nvecs <= 4) {
+        const dim3 block_nums(block_num_y, 1, 1);
+        mul_mat_vec_q_ncols<scalar_t, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, 4, vec_dot_iq4_nl_q8_1>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    } else if (nvecs > 4 && nvecs <= 8) {
+        const dim3 block_nums(block_num_y, 1, 1);
+        mul_mat_vec_q_ncols<scalar_t, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, 8, vec_dot_iq4_nl_q8_1>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    } else {
+        const dim3 block_nums(block_num_y, nvecs, 1);
+        mul_mat_vec_q<scalar_t, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    }
 }
 
 template<typename scalar_t>
 static void mul_mat_vec_iq4_xs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, nvecs, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    if (nvecs == 2) {
+        const dim3 block_nums(block_num_y, 1, 1);
+        mul_mat_vec_iq4_xs_q8_1_2col<scalar_t>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
+    } else if (nvecs > 2 && nvecs <= 4) {
+        const dim3 block_nums(block_num_y, 1, 1);
+        mul_mat_vec_q_ncols<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, 4, vec_dot_iq4_xs_q8_1>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    } else if (nvecs > 4 && nvecs <= 8) {
+        const dim3 block_nums(block_num_y, 1, 1);
+        mul_mat_vec_q_ncols<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, 8, vec_dot_iq4_xs_q8_1>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    } else {
+        const dim3 block_nums(block_num_y, nvecs, 1);
+        mul_mat_vec_q<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    }
 }
 
 template<typename scalar_t>
