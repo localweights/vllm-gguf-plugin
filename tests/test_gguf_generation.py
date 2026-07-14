@@ -88,13 +88,14 @@ def _generate_greedy_logprobs(
     quantization: str | None = None,
     tensor_parallel_size: int = 1,
     dtype: str = "auto",
+    hf_config_path: str | None = None,
 ) -> list[tuple[list[int], str, list[dict[int, float] | None]]]:
     """Generate greedy outputs with logprobs using vllm.LLM.
 
     Returns list of (token_ids, text, logprobs_list) tuples.
     Each logprobs element maps token_id -> logprob value.
     """
-    llm = LLM(
+    llm_kwargs: dict = dict(
         model=model_path,
         tokenizer=tokenizer_name,
         quantization=quantization,
@@ -103,6 +104,9 @@ def _generate_greedy_logprobs(
         dtype=dtype,
         tensor_parallel_size=tensor_parallel_size,
     )
+    if hf_config_path is not None:
+        llm_kwargs["hf_config_path"] = hf_config_path
+    llm = LLM(**llm_kwargs)
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=max_tokens,
@@ -194,6 +198,7 @@ def check_model_outputs(
         num_logprobs=num_logprobs,
         tokenizer_name=model.original_model,
         quantization="gguf",
+        hf_config_path=model.original_model,
     )
 
     original_outputs = _generate_greedy_logprobs(
@@ -264,6 +269,7 @@ def test_distributed(
         quantization="gguf",
         tensor_parallel_size=tp_size,
         dtype="half",
+        hf_config_path=model.original_model,
     )
 
     original_outputs = _generate_greedy_logprobs(
