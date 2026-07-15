@@ -57,9 +57,15 @@ class GGUFConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(
-        cls, hf_quant_cfg: dict[str, Any], user_quant: str | None
+        cls,
+        hf_quant_cfg: dict[str, Any],
+        user_quant: str | None,
+        hf_config: Any = None,
     ) -> "QuantizationMethods | None":
-        del hf_quant_cfg
+        # hf_config accepted to match vLLM 0.25's base-class call signature
+        # (passed positionally-by-keyword to every registered quant config —
+        # omitting it broke loading ANY non-GGUF model in this venv).
+        del hf_quant_cfg, hf_config
         if user_quant == "gguf":
             return "gguf"
         return None
