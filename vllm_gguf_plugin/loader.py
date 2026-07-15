@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from typing import cast
+from typing import Generator, cast
 
 import torch
 import torch.nn as nn
@@ -16,6 +16,7 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from .baked_weights import is_bake_valid, load_bake, save_bake
 from .quantization import GGUFConfig
 from .weight_utils import download_gguf, resolve_local_gguf
 from .weights_adapter import get_weights_adapter
@@ -118,10 +119,47 @@ class GGUFModelLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         adapter = self._prepare_adapter(model_config)
-        weights = adapter.prepare_weights(model_config)
-        if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
-            weights = _mem_debug_iterator(weights)
-        model.load_weights(weights)
+        gguf_path = adapter.load_spec.weights_source[0]
+
+        if is_bake_valid(gguf_path):
+            baked = load_bake(gguf_path)
+            n_tensors = len(baked)
+            total_gib = sum(
+                t.numel() * t.element_size() for t in baked.values()
+            ) / 2**30
+            logger.info(
+                "baked weight cache HIT (%s, %d tensors, %.2f GiB)",
+                gguf_path, n_tensors, total_gib,
+            )
+            model.load_weights(baked.items())
+        else:
+            captured: dict[str, torch.Tensor] = {}
+
+            def _capture(
+                it,
+            ) -> Generator[tuple[str, torch.Tensor], None, None]:
+                for name, t in it:
+                    captured[name] = t  # already on CPU from GGUF loader
+                    yield name, t
+
+            weights = _capture(adapter.prepare_weights(model_config))
+            if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
+                weights = _mem_debug_iterator(weights)
+            model.load_weights(weights)
+            try:
+                save_bake(gguf_path, captured)
+                total_gib = sum(
+                    t.numel() * t.element_size() for t in captured.values()
+                ) / 2**30
+                logger.info(
+                    "baked weight cache SAVED (%s, %d tensors, %.2f GiB)",
+                    gguf_path, len(captured), total_gib,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to save baked weight cache", exc_info=True
+                )
+
         _register_gdn_out_proj_perm(model, adapter)
         if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
             print(
@@ -144,10 +182,40 @@ class GGUFModelLoader(BaseModelLoader):
         )
 
         target_device = torch.device(device_config.device)
+        gguf_path = adapter.load_spec.weights_source[0]
+
+        if is_bake_valid(gguf_path):
+            baked = load_bake(gguf_path)
+            n_tensors = len(baked)
+            total_gib = sum(
+                t.numel() * t.element_size() for t in baked.values()
+            ) / 2**30
+            logger.info(
+                "baked weight cache HIT (%s, %d tensors, %.2f GiB)",
+                gguf_path, n_tensors, total_gib,
+            )
+            with set_default_torch_dtype(model_config.dtype):
+                with target_device:
+                    model = initialize_model(vllm_config=vllm_config, prefix=prefix)
+                model.load_weights(baked.items())
+                _register_gdn_out_proj_perm(model, adapter)
+                process_weights_after_loading(model, model_config, target_device)
+            return model
+
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
-            weights = adapter.prepare_weights(model_config)
+
+            captured: dict[str, torch.Tensor] = {}
+
+            def _capture(
+                it,
+            ) -> Generator[tuple[str, torch.Tensor], None, None]:
+                for name, t in it:
+                    captured[name] = t  # already on CPU from GGUF loader
+                    yield name, t
+
+            weights = _capture(adapter.prepare_weights(model_config))
             if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
                 weights = _mem_debug_iterator(weights)
             model.load_weights(weights)
@@ -158,6 +226,20 @@ class GGUFModelLoader(BaseModelLoader):
                     torch.cuda.memory_allocated() / 2**30,
                 )
             process_weights_after_loading(model, model_config, target_device)
+            try:
+                save_bake(gguf_path, captured)
+                total_gib = sum(
+                    t.numel() * t.element_size() for t in captured.values()
+                ) / 2**30
+                logger.info(
+                    "baked weight cache SAVED (%s, %d tensors, %.2f GiB)",
+                    gguf_path, len(captured), total_gib,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to save baked weight cache", exc_info=True
+                )
+
             if os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
                 logger.info(
                     "MEM-DEBUG post-process_weights allocated=%.2f GiB",
