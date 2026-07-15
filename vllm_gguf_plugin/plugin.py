@@ -138,3 +138,7 @@ def register() -> None:
     from .spec_plan_cache import install as _install_spec_plan_cache
 
     _install_spec_plan_cache()
+
+    from .mtp_eagle_group import _patch_eagle_group_annotation
+
+    _patch_eagle_group_annotation()
