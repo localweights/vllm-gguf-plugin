@@ -1322,6 +1322,70 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
+// 2-column fused variant: decodes the q5_K weight block (vl/vh/scales/mins)
+// ONCE and dots it against both activation columns via the same
+// vec_dot_q5_K_q8_1_impl_vmmq scalar function used by the 1-column path (called
+// twice, once per column, with that column's u/d8). Only the redundant weight
+// decode is eliminated; per-column math/op-order is byte-identical to
+// vec_dot_q5_K_q8_1, so results are bitwise-identical. Used by the MTP verify
+// batch=2 path (same pattern as vec_dot_iq4_xs_q8_1_2col, 758367d).
+static __device__ __forceinline__ void vec_dot_q5_K_q8_1_2col(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1_c0,
+    const block_q8_1 * __restrict__ bq8_1_c1, const int & iqs,
+    float & r0, float & r1) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq;
+
+    int   vl[2];
+    int   vh[2];
+    int    u0[2*QR5_K];
+    int    u1[2*QR5_K];
+    float d8_0[QR5_K];
+    float d8_1[QR5_K];
+
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+
+    vl[0] = ql[0];
+    vl[1] = ql[4];
+
+    vh[0] = qh[0] >> bq8_offset;
+    vh[1] = qh[4] >> bq8_offset;
+
+    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const block_q8_1 * bq8i_0 = bq8_1_c0 + bq8_offset + i;
+        const block_q8_1 * bq8i_1 = bq8_1_c1 + bq8_offset + i;
+        d8_0[i] = __low2float(bq8i_0->ds);
+        d8_1[i] = __low2float(bq8i_1->ds);
+
+        const int * q8_0 = (const int *)bq8i_0->qs + ((iqs/2)%4);
+        const int * q8_1 = (const int *)bq8i_1->qs + ((iqs/2)%4);
+        u0[2*i+0] = q8_0[0];
+        u0[2*i+1] = q8_0[4];
+        u1[2*i+0] = q8_1[0];
+        u1[2*i+1] = q8_1[4];
+    }
+
+    r0 += vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u0, sc, m, bq5_K->dm, d8_0);
+    r1 += vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u1, sc, m, bq5_K->dm, d8_1);
+#endif
+}
+
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q5_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
     __shared__ int   tile_x_ql[mmq_y * (2*WARP_SIZE_GGUF)     + mmq_y];
     __shared__ half2 tile_x_dm[mmq_y * (WARP_SIZE_GGUF/QI5_K) + mmq_y/QI5_K];
@@ -1438,6 +1502,48 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
+}
+
+// 2-column fused variant: decodes the q6_K weight block (vl/vh/scales) ONCE
+// and dots it against both activation columns via the same
+// vec_dot_q6_K_q8_1_impl_mmvq scalar function used by the 1-column path
+// (called twice, once per column). Per-column math/op-order is byte-identical
+// to vec_dot_q6_K_q8_1, so results are bitwise-identical. lm_head is q6_K
+// (248320 rows) -- the biggest single tensor read at MTP verify, priority
+// target for this fusion (same pattern as vec_dot_iq4_xs_q8_1_2col, 758367d).
+static __device__ __forceinline__ void vec_dot_q6_K_q8_1_2col(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1_c0,
+    const block_q8_1 * __restrict__ bq8_1_c1, const int & iqs,
+    float & r0, float & r1) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq;
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_from_uint8(bq6_K->ql, iqs);
+    const int vh = get_int_from_uint8(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int    u0[QR6_K];
+    int    u1[QR6_K];
+    float d8_0[QR6_K];
+    float d8_1[QR6_K];
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        u0[i]  = get_int_from_int8_aligned(bq8_1_c0[bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8_0[i] = __low2float(bq8_1_c0[bq8_offset + 2*i].ds);
+        u1[i]  = get_int_from_int8_aligned(bq8_1_c1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8_1[i] = __low2float(bq8_1_c1[bq8_offset + 2*i].ds);
+    }
+
+    const float d = __half2float(bq6_K->d);
+    r0 += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u0, scales, d, d8_0);
+    r1 += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u1, scales, d, d8_1);
+#endif
 }
 
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q6_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {

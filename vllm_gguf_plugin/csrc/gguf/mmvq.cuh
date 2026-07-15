@@ -142,6 +142,100 @@ static __global__ void mul_mat_vec_iq4_xs_q8_1_2col(const void * __restrict__ vx
     }
 }
 
+// Dedicated q5_K / q6_K 2-column kernels using the fused 2-col vec_dot: the
+// weight block is decoded once per (thread, block) and dotted against both
+// activation columns from registers. Bitwise-identical per-column math.
+// Mirrors mul_mat_vec_iq4_xs_q8_1_2col (758367d) for the K-quant path used by
+// the nextn draft head (q8_0, already fused) chain's lm_head (q6_K) and other
+// q5_K/q6_K serving tensors.
+template<typename scalar_t>
+static __global__ void mul_mat_vec_q5_K_q8_1_2col(const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows) {
+    constexpr int qk = QK_K;
+    constexpr int qi = QI5_K;
+    constexpr int vdr = VDR_Q5_K_Q8_1_MMVQ;
+
+    const auto row = blockIdx.x*blockDim.y + threadIdx.y;
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+
+    float tmp0 = 0.0f;
+    float tmp1 = 0.0f;
+
+    const block_q5_K * x = (const block_q5_K *) vx;
+    const block_q8_1  * y = (const block_q8_1 *) vy;
+
+    for (auto i = threadIdx.x / (qi/vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index (col 0) that aligns with ibx
+
+        const int iqs  = vdr * (threadIdx.x % (qi/vdr));
+
+        vec_dot_q5_K_q8_1_2col(&x[ibx], &y[iby], &y[(nrows_y/QK8_1) + iby], iqs, tmp0, tmp1);
+    }
+
+#pragma unroll
+    for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+        tmp0 += VLLM_SHFL_XOR_SYNC(tmp0, mask);
+        tmp1 += VLLM_SHFL_XOR_SYNC(tmp1, mask);
+    }
+
+    if (threadIdx.x == 0) {
+        dst[row] = tmp0;
+        dst[nrows + row] = tmp1;
+    }
+}
+
+template<typename scalar_t>
+static __global__ void mul_mat_vec_q6_K_q8_1_2col(const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows) {
+    constexpr int qk = QK_K;
+    constexpr int qi = QI6_K;
+    constexpr int vdr = VDR_Q6_K_Q8_1_MMVQ;
+
+    const auto row = blockIdx.x*blockDim.y + threadIdx.y;
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+
+    float tmp0 = 0.0f;
+    float tmp1 = 0.0f;
+
+    const block_q6_K * x = (const block_q6_K *) vx;
+    const block_q8_1  * y = (const block_q8_1 *) vy;
+
+    for (auto i = threadIdx.x / (qi/vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index (col 0) that aligns with ibx
+
+        const int iqs  = vdr * (threadIdx.x % (qi/vdr));
+
+        vec_dot_q6_K_q8_1_2col(&x[ibx], &y[iby], &y[(nrows_y/QK8_1) + iby], iqs, tmp0, tmp1);
+    }
+
+#pragma unroll
+    for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+        tmp0 += VLLM_SHFL_XOR_SYNC(tmp0, mask);
+        tmp1 += VLLM_SHFL_XOR_SYNC(tmp1, mask);
+    }
+
+    if (threadIdx.x == 0) {
+        dst[row] = tmp0;
+        dst[nrows + row] = tmp1;
+    }
+}
+
 template<typename scalar_t>
 static void mul_mat_vec_q4_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
@@ -245,13 +339,40 @@ static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
 }
 
+// rows_per_block occupancy tune (P3 sub-item 2), microbench-confirmed
+// (microbench_p3.py, RTX 3090 Ti sm_86): lm_head is q6_K, 248320 rows x 5120
+// cols -- far more rows than ssm_out/attn_gate (5120) or ffn (17408). At
+// MMV_Y2=2 lm_head's batch-2/batch-1 ratio measured 1.317 (worse than the
+// generic path this replaces); MMV_Y2=4 (4 warps/block, still under Ampere's
+// 16-blocks/SM ceiling) measured 1.040. ssm_out/attn_gate/ffn shapes measured
+// best at MMV_Y2=2 in both configs, so lm_head needs its own bucket, not a
+// blanket MMV_Y2 bump. Threshold nrows > 65536 is the only class boundary
+// that separates lm_head from every other shape in this model. Pure
+// launch-geometry switch -> bitwise-identical (see bitwise_check2.py int16
+// gate, all shapes/batches 1-8, 0 mismatches).
 template<typename scalar_t>
 static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+    if (nvecs == 2) {
+        const int mmv_y2 = (nrows > 65536) ? 4 : 2;
+        const dim3 block_dims2(WARP_SIZE, mmv_y2, 1);
+        const dim3 block_nums((nrows + mmv_y2 - 1) / mmv_y2, 1, 1);
+        mul_mat_vec_q5_K_q8_1_2col<scalar_t>
+            <<<block_nums, block_dims2, 0, stream>>>(vx, vy, dst, ncols, nrows);
+        return;
+    }
     mul_mat_vec_q_dispatch_cuda<scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template<typename scalar_t>
 static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+    if (nvecs == 2) {
+        const int mmv_y2 = (nrows > 65536) ? 4 : 2;
+        const dim3 block_dims2(WARP_SIZE, mmv_y2, 1);
+        const dim3 block_nums((nrows + mmv_y2 - 1) / mmv_y2, 1, 1);
+        mul_mat_vec_q6_K_q8_1_2col<scalar_t>
+            <<<block_nums, block_dims2, 0, stream>>>(vx, vy, dst, ncols, nrows);
+        return;
+    }
     mul_mat_vec_q_dispatch_cuda<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
