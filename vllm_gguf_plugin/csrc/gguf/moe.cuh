@@ -24,14 +24,20 @@ static __device__ __forceinline__ void moe_q(
 
   const auto col_dst_0 = blockIdx.y * mmq_x;
 
+  // Guards MUST precede the sorted_token_ids read below: out-of-extent
+  // blocks (blockIdx.y past the padded-token grid — legal at warmup/
+  // profiling shapes) previously read past the end of sorted_token_ids,
+  // and the garbage fed token_offs -> col_dst, which is only checked
+  // against ncols_dst — a valid-looking but WRONG dst column write
+  // (intermittent Xid 31 VIRT_WRITE corruption, 2026-07-15).
+  const int exp_idx = expert_ids[blockIdx.y];
+  if (exp_idx > 255 || exp_idx < 0) return;
+  if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
+
   int token_offs[mmq_x / nwarps];
   for (int i = 0; i < mmq_x; i += nwarps) {
     token_offs[i / nwarps] = sorted_token_ids[col_dst_0 + threadIdx.y + i];
   }
-
-  const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx > 255 || exp_idx < 0) return;
-  if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
   const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);

@@ -52,6 +52,15 @@ def _fused_moe_gguf(
     topk_ids = topk_ids.to(dtype=torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
+    # The kernels derive launch grids from num_tokens (= x.shape[0]) but
+    # index token routing via topk_ids — a size mismatch (possible at
+    # warmup/dummy-batch or post-sleep-wake reallocation shapes) is a
+    # silent OOB write. Fail loudly instead.
+    assert x.shape[0] == topk_ids.shape[0] == topk_weights.shape[0], (
+        f"fused_moe token-count mismatch: x={x.shape[0]} "
+        f"topk_ids={topk_ids.shape[0]} topk_weights={topk_weights.shape[0]}"
+    )
+
     def act(inp: torch.Tensor):
         d = inp.shape[-1] // 2
         output_shape = inp.shape[:-1] + (d,)
