@@ -134,3 +134,7 @@ def register() -> None:
     from .mtp_dynamic_skip import install as _install_mtp_dynamic_skip
 
     _install_mtp_dynamic_skip()
+
+    from .spec_plan_cache import install as _install_spec_plan_cache
+
+    _install_spec_plan_cache()
