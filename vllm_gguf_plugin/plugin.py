@@ -142,3 +142,7 @@ def register() -> None:
     from .mtp_eagle_group import _patch_eagle_group_annotation
 
     _patch_eagle_group_annotation()
+
+    from .sleep_wake_hybrid import _patch_init_fp8_kv_scales
+
+    _patch_init_fp8_kv_scales()
