@@ -77,22 +77,31 @@ def _store_gguf_loaded_weight(
     loaded_weight: torch.Tensor,
     shard_id: int | str | None = None,
 ) -> None:
-    loaded_weight = _clone_loaded_weight(loaded_weight).to(device=param.device)
-    if shard_id is None:
-        _materialize_parameter_data(
-            param, tuple(loaded_weight.shape), loaded_weight.dtype
-        )
-        param.data.copy_(loaded_weight)
+    loaded_weight = _clone_loaded_weight(loaded_weight)
+    if shard_id is not None:
+        if loaded_weight.device.type == "cuda":
+            loaded_weight = loaded_weight.cpu()
+        loaded_weight = loaded_weight.contiguous()
+        if torch.cuda.is_available():
+            try:
+                loaded_weight = loaded_weight.pin_memory()
+            except RuntimeError:
+                pass
+        if shard_id not in param.shard_id_map:
+            param.shard_id_map[shard_id] = len(param.data_container)
+            param.data_container.append(loaded_weight)
+            param.shard_id.append(shard_id)
+        else:
+            param.data_container[param.shard_id_map[shard_id]] = loaded_weight
+        if not isinstance(param, UninitializedParameter) and param.data.numel() == 0:
+            param.data = loaded_weight
         return
 
-    if shard_id not in param.shard_id_map:
-        param.shard_id_map[shard_id] = len(param.data_container)
-        param.data_container.append(loaded_weight)
-        param.shard_id.append(shard_id)
-    else:
-        param.data_container[param.shard_id_map[shard_id]] = loaded_weight
-    if not isinstance(param, UninitializedParameter) and param.data.numel() == 0:
-        param.data = loaded_weight
+    loaded_weight = loaded_weight.to(device=param.device)
+    _materialize_parameter_data(
+        param, tuple(loaded_weight.shape), loaded_weight.dtype
+    )
+    param.data.copy_(loaded_weight)
 
 
 def _store_gguf_weight_type(
@@ -139,7 +148,9 @@ def _gguf_embedding_weight_loader(
     param: Parameter | UninitializedParameter,
     loaded_weight: torch.Tensor,
 ) -> None:
-    loaded_weight = _clone_loaded_weight(loaded_weight).to(device=param.device)
+    loaded_weight = _clone_loaded_weight(loaded_weight)
+    if loaded_weight.device.type == "cuda":
+        loaded_weight = loaded_weight.cpu()
     start_idx = layer.shard_indices.org_vocab_start_index
     shard_size = layer.shard_indices.org_vocab_end_index - start_idx
     loaded_weight = loaded_weight.narrow(param.output_dim, start_idx, shard_size)

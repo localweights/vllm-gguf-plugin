@@ -210,6 +210,11 @@ class GGUFLinearMethod(LinearMethodBase):
         qweight = layer.qweight
         shard_id_map = qweight.shard_id_map
         shard_id = qweight.shard_id
+        target_device = (
+            qweight.device
+            if qweight.device.type == "cuda"
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
         if len(data_container := qweight.data_container) > 1:
             dtype = {data.dtype for data in data_container}
             assert len(dtype) == 1, ValueError(
@@ -219,37 +224,29 @@ class GGUFLinearMethod(LinearMethodBase):
             padded_side = max(x.size(1) for x in data_container)
             concat_side = sum(x.size(0) for x in data_container)
             padded_data = torch.zeros(
-                (concat_side, padded_side), dtype=dtype, device=qweight.device
+                (concat_side, padded_side), dtype=dtype, device=target_device
             )
             shard_offset_map = dict[str, tuple[int, int, int]]()
             ordered_shard_ids = _gguf_ordered_shard_ids(shard_id)
             current_offset = 0
+            use_non_blocking = target_device.type == "cuda"
             for idx in ordered_shard_ids:
                 id_in_container = shard_id_map[idx]
                 start = current_offset
                 end = start + data_container[id_in_container].size(0)
                 size = data_container[id_in_container].size(1)
-                padded_data[start:end, :size] = data_container[id_in_container]
-                # Release this shard's GPU memory immediately after copying.
-                # Owner of the slot: _create_padded_weight_param (this method).
-                # Removed on success: set to None here after copy.
-                # Removed on failure: exception propagates, padded_data discarded.
-                shard_nbytes = data_container[id_in_container].nbytes
-                shard_refs = None
-                import os as _os
-                if _os.environ.get("VLLM_GGUF_MEM_DEBUG") == "1":
-                    import sys as _sys
-                    shard_refs = _sys.getrefcount(data_container[id_in_container])
-                data_container[id_in_container] = None
-                if shard_refs is not None:
-                    print(
-                        f"MEM-DEBUG shard-free idx={idx} bytes={shard_nbytes} "
-                        f"refs-before-free={shard_refs} "
-                        f"alloc={torch.cuda.memory_allocated() / 2**30:.3f} GiB",
-                        flush=True,
-                    )
+                padded_data[start:end, :size].copy_(
+                    data_container[id_in_container], non_blocking=use_non_blocking
+                )
                 shard_offset_map[idx] = (start, end, size)
                 current_offset = end
+            # Shards are CPU staging tensors (possibly pinned). A pinned source
+            # must outlive its async H2D copy — synchronize BEFORE dropping the
+            # container references; never free inside the copy loop.
+            if use_non_blocking:
+                torch.cuda.synchronize()
+            for i in range(len(data_container)):
+                data_container[i] = None
             padded_param = GGUFWeightParameter(
                 data=padded_data,
                 weight_loader=qweight.weight_loader,
@@ -271,6 +268,10 @@ class GGUFLinearMethod(LinearMethodBase):
                     0, dtype=qweight.dtype, device=qweight.device
                 )
             layer.register_parameter("qweight", padded_param)
+        elif len(data_container) == 1:
+            # Single shard: move CPU staging tensor to target device.
+            qweight.data = data_container[0].to(target_device)
+            data_container.clear()
 
     def apply(
         self,
