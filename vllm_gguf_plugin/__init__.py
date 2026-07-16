@@ -6,6 +6,13 @@ from .op_guard import install_idempotent_op_registration
 # imports register duplicate vllm:: custom ops — see op_guard.py.
 install_idempotent_op_registration()
 
+try:
+    from .offload_instrument import install as _install_offload_instrument
+
+    _install_offload_instrument()
+except ImportError:
+    pass
+
 from .config_parser import GGUFConfigParser  # noqa: E402
 from .loader import GGUFModelLoader
 from .plugin import OOTGGUFConfig, OOTGGUFModelLoader, register
