@@ -32,7 +32,11 @@ static __device__ __forceinline__ void moe_q(
   // (intermittent Xid 31 VIRT_WRITE corruption, 2026-07-15).
   const int exp_idx = expert_ids[blockIdx.y];
   if (exp_idx > 255 || exp_idx < 0) return;
-  if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
+  // '>=' not '>': a block starting EXACTLY at the padded extent (npp a
+  // multiple of mmq_x) is fully out-of-extent — with '>' it fell through
+  // and the sorted_token_ids reads below ran past the array end
+  // (third Xid 31 site, 2026-07-16: 4 crashes under concurrent decode).
+  if (blockIdx.y * mmq_x >= (unsigned)num_tokens_post_padded[0]) return;
 
   int token_offs[mmq_x / nwarps];
   for (int i = 0; i < mmq_x; i += nwarps) {
@@ -119,7 +123,10 @@ static __device__ __forceinline__ void moe_q(
 #pragma unroll
   for (int j = 0; j < mmq_x; j += nwarps) {
     const int col_dst = token_offs[j / nwarps];
-    if (col_dst >= ncols_dst) {
+    // unsigned compare also rejects negative garbage from any straddled
+    // sorted_token_ids read — a negative col_dst passed the signed check
+    // and produced a wild dst write (Xid 31 VIRT_WRITE).
+    if ((unsigned)col_dst >= (unsigned)ncols_dst) {
       return;
     }
 
