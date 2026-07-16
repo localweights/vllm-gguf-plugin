@@ -23,15 +23,28 @@ logger = logging.getLogger(__name__)
 
 
 def _compute_ranges(tensors):
-    """Build (lo, hi) uint64 array from a list of torch Tensors."""
-    ranges = np.array(
-        [
-            (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size())
-            for t in tensors
-        ],
-        dtype=np.uint64,
-    )
-    return ranges
+    """Build (lo, hi) uint64 array from a list of torch Tensors.
+
+    Uses the UNTYPED STORAGE extent, not data_ptr + numel*element_size:
+    the CPU offload tensors are per-layer-group STRIDED VIEWS into one
+    shared (num_blocks, row_stride) region, and the contiguous formula
+    under-measures a strided view's physical span. That under-measure
+    made every legitimate whole-row transfer look out-of-bounds and
+    killed the engine on first offload traffic (false positives
+    2026-07-16 12:37/20:56/20:58 — see journal; the real Xid 31 was the
+    moe.cuh padded-extent guard, fixed separately).
+    """
+    ranges = []
+    for t in tensors:
+        try:
+            st = t.untyped_storage()
+            lo = st.data_ptr()
+            hi = lo + st.nbytes()
+        except Exception:
+            lo = t.data_ptr()
+            hi = lo + t.numel() * t.element_size()
+        ranges.append((lo, hi))
+    return np.array(ranges, dtype=np.uint64)
 
 
 def _tensor_ids(tensors):
