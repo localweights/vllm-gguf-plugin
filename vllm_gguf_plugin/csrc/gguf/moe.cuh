@@ -30,20 +30,26 @@ static __device__ __forceinline__ void moe_q(
   // and the garbage fed token_offs -> col_dst, which is only checked
   // against ncols_dst — a valid-looking but WRONG dst column write
   // (intermittent Xid 31 VIRT_WRITE corruption, 2026-07-15).
-  const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx > 255 || exp_idx < 0) return;
   // '>=' not '>': a block starting EXACTLY at the padded extent (npp a
   // multiple of mmq_x) is fully out-of-extent — with '>' it fell through
   // and the sorted_token_ids reads below ran past the array end
   // (third Xid 31 site, 2026-07-16: 4 crashes under concurrent decode).
+  // Extent guard FIRST: out-of-extent blocks must not even read
+  // expert_ids — at warmup/CUDA-graph max-grid shapes blockIdx.y can
+  // exceed the live expert_ids extent too (fourth-site audit 2026-07-16).
   if (blockIdx.y * mmq_x >= (unsigned)num_tokens_post_padded[0]) return;
+  const int exp_idx = expert_ids[blockIdx.y];
+  if (exp_idx > 255 || exp_idx < 0) return;
 
   int token_offs[mmq_x / nwarps];
   for (int i = 0; i < mmq_x; i += nwarps) {
     token_offs[i / nwarps] = sorted_token_ids[col_dst_0 + threadIdx.y + i];
   }
 
-  const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
+  // int64 cast: exp_idx * exp_stride overflows int32 for large per-expert
+  // strides (silent wrong-expert pointer on read side).
+  const block_q_t* x =
+      (const block_q_t*)((const char*)vx + (int64_t)exp_idx * (int64_t)exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);
 
   int* tile_x_ql = nullptr;
