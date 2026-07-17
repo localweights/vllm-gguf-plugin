@@ -151,3 +151,53 @@ def test_cache_recomputes_on_tensor_identity_change():
     assert call_count == 2, "must still work after tensor identity change"
 
     # Original spec should now be stale but we don't call it again
+
+
+def test_strided_view_row_in_bounds_and_scalar_wrong_block_caught(tmp_path):
+    """View-footprint ranges: whole-row transfers of a strided view into a
+    shared region validate in-bounds (the 2026-07-16 false-positive class),
+    while a wrong-block scalar op past the view's footprint is caught even
+    though it stays inside the same backing storage (which the old
+    untyped_storage extent would have masked)."""
+    base = torch.zeros(10 * 64, dtype=torch.uint8)  # shared region
+    # view: 4 blocks x 16B rows, row_stride 64 -> footprint 3*64+16 = 208B
+    view = torch.as_strided(base, size=(4, 16), stride=(64, 1))
+    handler = SimpleNamespace(
+        src_tensors=[view],
+        dst_tensors=[torch.zeros(256, dtype=torch.uint8)],
+        gpu_to_cpu=True,
+        src_block_size_factor=1,
+        dst_block_size_factor=1,
+    )
+    calls = []
+
+    def real_swap(src, dst, sizes):
+        calls.append(len(src))
+
+    wrapped = wrap_swap_blocks(handler, real_swap)
+    dst_ptr = handler.dst_tensors[0].data_ptr()
+
+    # all 4 whole-row ops, including last row (would OOB under
+    # data_ptr+numel*elemsize = 64B extent) -> must pass
+    src_ptrs = np.array([view.data_ptr() + b * 64 for b in range(4)], dtype=np.uint64)
+    dst_ptrs = np.array([dst_ptr + b * 16 for b in range(4)], dtype=np.uint64)
+    sizes = np.full(4, 16, dtype=np.uint64)
+    wrapped(torch.from_numpy(src_ptrs), torch.from_numpy(dst_ptrs), torch.from_numpy(sizes))
+    assert calls == [4]
+
+    # wrong-block scalar: 4B read at block index 5 (past the 4-block view
+    # footprint) but still inside the 640B backing storage
+    log = tmp_path / "instr.jsonl"
+    os.environ["VLLM_GGUF_OFFLOAD_INSTRUMENT_LOG"] = str(log)
+    try:
+        bad_src = np.array([view.data_ptr() + 5 * 64], dtype=np.uint64)
+        with pytest.raises(RuntimeError, match="bounds violation"):
+            wrapped(
+                torch.from_numpy(bad_src),
+                torch.from_numpy(np.array([dst_ptr], dtype=np.uint64)),
+                torch.from_numpy(np.array([4], dtype=np.uint64)),
+            )
+        rec = json.loads(log.read_text().splitlines()[-1])
+        assert rec["offending_ops"][0]["size"] == 4
+    finally:
+        os.environ.pop("VLLM_GGUF_OFFLOAD_INSTRUMENT_LOG", None)

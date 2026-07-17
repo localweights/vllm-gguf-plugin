@@ -25,21 +25,32 @@ logger = logging.getLogger(__name__)
 def _compute_ranges(tensors):
     """Build (lo, hi) uint64 array from a list of torch Tensors.
 
-    Uses the UNTYPED STORAGE extent, not data_ptr + numel*element_size:
-    the CPU offload tensors are per-layer-group STRIDED VIEWS into one
-    shared (num_blocks, row_stride) region, and the contiguous formula
-    under-measures a strided view's physical span. That under-measure
-    made every legitimate whole-row transfer look out-of-bounds and
-    killed the engine on first offload traffic (false positives
-    2026-07-16 12:37/20:56/20:58 — see journal; the real Xid 31 was the
-    moe.cuh padded-extent guard, fixed separately).
+    Uses the exact STRIDED-VIEW FOOTPRINT: lo = data_ptr, hi = data_ptr +
+    element_size * (1 + sum((size_d - 1) * stride_d)) — the last reachable
+    element of the view plus one.
+
+    History of this formula:
+    - data_ptr + numel*element_size under-measures a strided view (the CPU
+      offload tensors are per-layer-group views into one shared
+      (num_blocks, row_stride) region) → every legitimate whole-row
+      transfer looked out-of-bounds and killed the engine (false positives
+      2026-07-16 12:37/20:56/20:58 — see journal).
+    - untyped_storage().nbytes() over-measures: a per-layer scale scalar
+      living inside a large allocator pool reports the whole pool as its
+      extent, so a wrong-block 4-byte scale read/write validates as
+      in-bounds. The view footprint is tight for both cases.
     """
     ranges = []
     for t in tensors:
         try:
-            st = t.untyped_storage()
-            lo = st.data_ptr()
-            hi = lo + st.nbytes()
+            lo = t.data_ptr()
+            if t.numel() == 0:
+                hi = lo
+            else:
+                span_elems = 1 + sum(
+                    (sz - 1) * st for sz, st in zip(t.shape, t.stride())
+                )
+                hi = lo + span_elems * t.element_size()
         except Exception:
             lo = t.data_ptr()
             hi = lo + t.numel() * t.element_size()
