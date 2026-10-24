@@ -23,15 +23,39 @@ logger = logging.getLogger(__name__)
 
 
 def _compute_ranges(tensors):
-    """Build (lo, hi) uint64 array from a list of torch Tensors."""
-    ranges = np.array(
-        [
-            (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size())
-            for t in tensors
-        ],
-        dtype=np.uint64,
-    )
-    return ranges
+    """Build (lo, hi) uint64 array from a list of torch Tensors.
+
+    Uses the exact STRIDED-VIEW FOOTPRINT: lo = data_ptr, hi = data_ptr +
+    element_size * (1 + sum((size_d - 1) * stride_d)) — the last reachable
+    element of the view plus one.
+
+    History of this formula:
+    - data_ptr + numel*element_size under-measures a strided view (the CPU
+      offload tensors are per-layer-group views into one shared
+      (num_blocks, row_stride) region) → every legitimate whole-row
+      transfer looked out-of-bounds and killed the engine (false positives
+      2026-07-16 12:37/20:56/20:58 — see journal).
+    - untyped_storage().nbytes() over-measures: a per-layer scale scalar
+      living inside a large allocator pool reports the whole pool as its
+      extent, so a wrong-block 4-byte scale read/write validates as
+      in-bounds. The view footprint is tight for both cases.
+    """
+    ranges = []
+    for t in tensors:
+        try:
+            lo = t.data_ptr()
+            if t.numel() == 0:
+                hi = lo
+            else:
+                span_elems = 1 + sum(
+                    (sz - 1) * st for sz, st in zip(t.shape, t.stride())
+                )
+                hi = lo + span_elems * t.element_size()
+        except Exception:
+            lo = t.data_ptr()
+            hi = lo + t.numel() * t.element_size()
+        ranges.append((lo, hi))
+    return np.array(ranges, dtype=np.uint64)
 
 
 def _tensor_ids(tensors):
