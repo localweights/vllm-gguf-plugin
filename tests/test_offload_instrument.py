@@ -201,3 +201,81 @@ def test_strided_view_row_in_bounds_and_scalar_wrong_block_caught(tmp_path):
         assert rec["offending_ops"][0]["size"] == 4
     finally:
         os.environ.pop("VLLM_GGUF_OFFLOAD_INSTRUMENT_LOG", None)
+
+
+def _run(handler, src_ptrs, dst_ptrs, size):
+    calls = []
+    wrapped = wrap_swap_blocks(handler, lambda s, d, z: calls.append(len(s)))
+    n = len(src_ptrs)
+    wrapped(
+        torch.from_numpy(np.array(src_ptrs, dtype=np.uint64)),
+        torch.from_numpy(np.array(dst_ptrs, dtype=np.uint64)),
+        torch.from_numpy(np.full(n, size, dtype=np.uint64)),
+    )
+    return calls
+
+
+def _handler(src, dst):
+    return SimpleNamespace(
+        src_tensors=src,
+        dst_tensors=dst,
+        gpu_to_cpu=True,
+        src_block_size_factor=1,
+        dst_block_size_factor=1,
+    )
+
+
+def test_contiguous_buffer_bounds(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_GGUF_OFFLOAD_INSTRUMENT_LOG", str(tmp_path / "l.jsonl"))
+    buf = torch.zeros(8, 32, dtype=torch.uint8)
+    other = torch.zeros(8, 32, dtype=torch.uint8)
+    h = _handler([buf], [other])
+    base, obase = buf.data_ptr(), other.data_ptr()
+    assert _run(h, [base + 7 * 32], [obase + 7 * 32], 32) == [1]
+    with pytest.raises(RuntimeError, match="bounds violation"):
+        _run(h, [base + 8 * 32], [obase], 32)  # block 8 of 8
+    with pytest.raises(RuntimeError, match="bounds violation"):
+        _run(h, [base + 7 * 32], [obase + 7 * 32 + 1], 32)  # straddles end
+
+
+def _shared_layer_views(num_layers=4, num_blocks=64, block_bytes=128):
+    """vLLM-style CPU KV: per-layer views into one allocation, block stride
+    spans all layers, so the views are non-contiguous."""
+    base = torch.zeros(num_blocks * num_layers * block_bytes, dtype=torch.uint8)
+    stride = num_layers * block_bytes
+    views = [
+        torch.as_strided(
+            base,
+            size=(num_blocks, block_bytes),
+            stride=(stride, 1),
+            storage_offset=layer * block_bytes,
+        )
+        for layer in range(num_layers)
+    ]
+    return base, views, stride, block_bytes
+
+
+def test_strided_per_layer_views_late_block_passes(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_GGUF_OFFLOAD_INSTRUMENT_LOG", str(tmp_path / "l.jsonl"))
+    _, views, stride, bb = _shared_layer_views()
+    gpu = [torch.zeros(64, bb, dtype=torch.uint8) for _ in views]
+    h = _handler(gpu, views)
+    last = 63
+    # numel*element_size of one view is 64*128 B, far below the true span
+    dst = [v.data_ptr() + last * stride for v in views]
+    src = [g.data_ptr() + last * bb for g in gpu]
+    assert _run(h, src, dst, bb) == [len(views)]
+
+
+def test_strided_view_block_past_end_still_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_GGUF_OFFLOAD_INSTRUMENT_LOG", str(tmp_path / "l.jsonl"))
+    _, views, stride, bb = _shared_layer_views()
+    gpu = [torch.zeros(64, bb, dtype=torch.uint8) for _ in views]
+    h = _handler(gpu, views)
+    v = views[0]
+    with pytest.raises(RuntimeError, match="bounds violation"):
+        _run(h, [gpu[0].data_ptr()], [v.data_ptr() + 64 * stride], bb)  # block 64 of 64
+    with pytest.raises(RuntimeError, match="bounds violation"):
+        # the check accepts any dst view's range, so overrun the last layer's
+        # view, which ends at the allocation end
+        _run(h, [gpu[0].data_ptr()], [views[-1].data_ptr() + 63 * stride + 1], bb)
