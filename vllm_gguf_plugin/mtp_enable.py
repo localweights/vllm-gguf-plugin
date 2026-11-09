@@ -185,49 +185,179 @@ def install() -> None:
                     f"{b}.attn_output.weight": "mtp.layers.0.self_attn.o_proj.weight",
                     f"{b}.attn_q_norm.weight": "mtp.layers.0.self_attn.q_norm.weight",
                     f"{b}.attn_k_norm.weight": "mtp.layers.0.self_attn.k_norm.weight",
-                    "token_embd.weight": "mtp.embed_tokens.weight",
-                    "output.weight": "lm_head.weight",
+                    # NOTE: token_embd/output are deliberately NOT mapped: the
+                    # draft shares the target's embed_tokens/lm_head modules
+                    # (see the placeholder patch below), so loading its own
+                    # copies would only waste ~1.3 GiB.
                 }
             return _orig_build(self, model_config)
 
         A.build_name_map = build_name_map
         A._gguf_mtp_namemap_patched = True
 
-    # ---- Graceful embed/lm_head sharing for GGUF-quantized target ----
-    # vLLM's MTP proposer shares the target's embed_tokens/lm_head with the draft
-    # to save memory, assuming a plain `.weight`. GGUF-quantized modules expose
-    # `qweight` (no `.weight`) -> AttributeError. Our draft already loaded its own
-    # embed_tokens (token_embd) and lm_head (output) from the gguf, so sharing is
-    # a pure optimization: skip it gracefully when it can't be done.
+    # ---- Draft shares the target's (GGUF-quantized) embed_tokens / lm_head ----
+    # Qwen3_5MTP allocates its own VocabParallelEmbedding + ParallelLMHead
+    # (~1.3 GiB for the 248k vocab) which both runners then replace with the
+    # target's modules -- but the memory is already allocated (and counted as
+    # weights) by then. So under the GGUF lane we construct the draft with
+    # parameter-less placeholders; the share step installs the real modules:
+    #   MRV2: eagle/utils.load_eagle_model (assigns target embed_tokens/lm_head;
+    #         Qwen3_5MTP declares no has_own_* so _should_share -> True).
+    #   MRV1: SpecDecodeBaseProposer._maybe_share_* (wrapped below so module-
+    #         level sharing works even when the target params are quantized).
+    import torch.nn as _nn
+
+    class _SharedPlaceholder(_nn.Module):
+        """Parameter-less stand-in, replaced by the target's module at share time."""
+
+        def forward(self, *a, **k):
+            raise RuntimeError(
+                "[mtp_enable] draft embed_tokens/lm_head placeholder was never "
+                "replaced by the target's module (share step did not run)"
+            )
+
+        def tie_weights(self, *a, **k):
+            return self
+
+    def _is_gguf_cfg(vllm_config) -> bool:
+        qc = getattr(vllm_config, "quant_config", None)
+        try:
+            if qc is not None and qc.get_name() == "gguf":
+                return True
+        except Exception:
+            pass
+        lc = getattr(vllm_config, "load_config", None)
+        return str(getattr(lc, "load_format", "")).lower() == "gguf"
+
+    try:
+        from vllm.model_executor.models import qwen3_5_mtp as _q
+    except Exception:  # model file absent on some vLLM versions
+        _q = None
+    if _q is not None and not getattr(_q, "_gguf_mtp_placeholder_patched", False):
+
+        def _wrap_init(cls):
+            _orig_init = cls.__init__
+
+            def __init__(self, *args, **kwargs):
+                vc = kwargs.get("vllm_config")
+                if vc is None and args:
+                    vc = args[0]
+                if not _is_gguf_cfg(vc):
+                    return _orig_init(self, *args, **kwargs)
+                saved = (_q.VocabParallelEmbedding, _q.ParallelLMHead)
+                _q.VocabParallelEmbedding = lambda *a, **k: _SharedPlaceholder()
+                _q.ParallelLMHead = lambda *a, **k: _SharedPlaceholder()
+                try:
+                    _orig_init(self, *args, **kwargs)
+                finally:
+                    _q.VocabParallelEmbedding, _q.ParallelLMHead = saved
+
+            cls.__init__ = __init__
+
+        # Only the two classes that allocate embed/lm_head (MoE MTP inherits
+        # Qwen3_5MTP.__init__ via super()).
+        _wrap_init(_q.Qwen3_5MultiTokenPredictor)
+        _wrap_init(_q.Qwen3_5MTP)
+        _q._gguf_mtp_placeholder_patched = True
+
+    def _is_placeholder_draft(draft) -> bool:
+        return isinstance(
+            getattr(getattr(draft, "model", None), "embed_tokens", None),
+            _SharedPlaceholder,
+        ) or isinstance(getattr(draft, "lm_head", None), _SharedPlaceholder)
+
+    # MRV1 (vLLM 0.25 and 0.33's SpecDecodeBaseProposer): share at MODULE
+    # level -- no `.weight` access, so quantized target params are fine.
     from vllm.v1.spec_decode import llm_base_proposer as _prop
 
     P = _prop.SpecDecodeBaseProposer
     if not getattr(P, "_gguf_mtp_share_patched", False):
-        _oe = P._maybe_share_embeddings
-        _ol = P._maybe_share_lm_head
 
-        def _maybe_share_embeddings(self, target_language_model):
-            try:
-                return _oe(self, target_language_model)
-            except AttributeError:
-                print(
-                    "[mtp_enable] target embed_tokens is GGUF-quantized (no .weight); "
-                    "keeping the draft's own loaded embed_tokens (no sharing).",
-                    flush=True,
+        def _share_embeddings(self, target_language_model):
+            inner = getattr(target_language_model, "model", None)
+            target_embed = getattr(inner, "embed_tokens", None) or getattr(
+                inner, "embedding", None
+            )
+            if target_embed is None:
+                raise AttributeError("Target model has no embed_tokens/embedding")
+            draft_inner = self.model.model
+            if hasattr(draft_inner, "embed_tokens"):
+                del draft_inner.embed_tokens
+            draft_inner.embed_tokens = target_embed
+            print(
+                "[mtp_enable] draft shares target embed_tokens/lm_head "
+                "(no draft copy allocated) [MRV1 embed_tokens]",
+                flush=True,
+            )
+
+        def _share_lm_head(self, target_language_model):
+            target_head = getattr(target_language_model, "lm_head", None)
+            if target_head is None:
+                raise AttributeError("Target model has no lm_head")
+            if hasattr(self.model, "lm_head"):
+                del self.model.lm_head
+            self.model.lm_head = target_head
+            # Per-layer shared_head.head references (DeepSeek-style MTP) too.
+            layers = getattr(getattr(self.model, "model", None), "layers", None)
+            if layers is not None:
+                items = (
+                    layers.values() if isinstance(layers, _nn.ModuleDict) else layers
                 )
+                for layer in items:
+                    sh = getattr(layer, "shared_head", None)
+                    if sh is not None and hasattr(sh, "head"):
+                        del sh.head
+                        sh.head = target_head
+            print(
+                "[mtp_enable] draft shares target embed_tokens/lm_head "
+                "(no draft copy allocated) [MRV1 lm_head]",
+                flush=True,
+            )
 
-        def _maybe_share_lm_head(self, target_language_model):
-            try:
-                return _ol(self, target_language_model)
-            except AttributeError:
-                print(
-                    "[mtp_enable] target lm_head is GGUF-quantized (no .weight); "
-                    "keeping the draft's own loaded lm_head (no sharing).",
-                    flush=True,
-                )
+        def _wrap(orig, mine):
+            def f(self, target_language_model):
+                # Only the GGUF MTP draft (placeholders) needs this; every
+                # other drafter keeps upstream logic.
+                if _is_placeholder_draft(getattr(self, "model", None)):
+                    return mine(self, target_language_model)
+                return orig(self, target_language_model)
 
-        P._maybe_share_embeddings = _maybe_share_embeddings
-        P._maybe_share_lm_head = _maybe_share_lm_head
+            return f
+
+        P._maybe_share_embeddings = _wrap(P._maybe_share_embeddings, _share_embeddings)
+        P._maybe_share_lm_head = _wrap(P._maybe_share_lm_head, _share_lm_head)
         P._gguf_mtp_share_patched = True
+
+    # MRV2 (0.33): eagle/utils.load_eagle_model calls maybe_share_target_embed
+    # via a module-global lookup (patchable; load_eagle_model itself is bound by
+    # name into the speculators, so it is not). Wrap it to log + verify.
+    try:
+        from vllm.v1.worker.gpu.spec_decode.eagle import utils as _eu
+    except Exception:
+        _eu = None
+    if _eu is not None and not getattr(_eu, "_gguf_mtp_log_patched", False):
+        _orig_share = _eu.maybe_share_target_embed
+
+        def maybe_share_target_embed(draft_model, draft_inner, target_inner):
+            was_placeholder = isinstance(
+                getattr(draft_inner, "embed_tokens", None), _SharedPlaceholder
+            )
+            _orig_share(draft_model, draft_inner, target_inner)
+            if was_placeholder:
+                if isinstance(
+                    getattr(draft_inner, "embed_tokens", None), _SharedPlaceholder
+                ):
+                    raise RuntimeError(
+                        "[mtp_enable] MRV2 share left the draft embed_tokens "
+                        "placeholder in place"
+                    )
+                print(
+                    "[mtp_enable] draft shares target embed_tokens/lm_head "
+                    "(no draft copy allocated) [MRV2]",
+                    flush=True,
+                )
+
+        _eu.maybe_share_target_embed = maybe_share_target_embed
+        _eu._gguf_mtp_log_patched = True
 
     print("[mtp_enable] qwen3_5 MTP speculative override INSTALLED", flush=True)
