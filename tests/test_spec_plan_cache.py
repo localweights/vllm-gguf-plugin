@@ -177,3 +177,95 @@ def test_plugin_module_importable_without_gpu():
         mod.install()  # no-op, must not raise / must not import vllm
     finally:
         os.environ.pop(ENV_VAR, None)
+
+
+# ---------------------------------------------------------------------------
+# 0.33 buffer-shape adaptation: paged_kv_indices is a plain CUDA tensor there
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_buffer_accepts_cpugpubuffer_and_plain_tensor():
+    """vLLM 0.25 stores paged_kv_indices in a CpuGpuBuffer (`.gpu` view);
+    0.33 allocates it as a plain CUDA tensor. Both must be unwrapped."""
+    from types import SimpleNamespace
+
+    from vllm_gguf_plugin.spec_plan_cache import _gpu_buffer
+
+    gpu = torch.arange(4)
+    assert _gpu_buffer(SimpleNamespace(cpu=torch.zeros(4), gpu=gpu)) is gpu
+    assert _gpu_buffer(gpu) is gpu
+
+
+class _FakeBuffer:
+    """CpuGpuBuffer stand-in: `.np` (cpu numpy) + `.gpu` + `.cpu`.
+
+    ``.gpu`` aliases the same storage as ``.cpu`` so a CPU-side write is
+    observable without emulating the async copy.
+    """
+
+    def __init__(self, values):
+        self.cpu = torch.as_tensor(values, dtype=torch.int32)
+        self.np = self.cpu.numpy()
+        self.gpu = self.cpu
+
+
+class _GpuViewProbe:
+    """Minimal CpuGpuBuffer-shaped holder (only `.gpu` is read by the patch)."""
+
+    def __init__(self, gpu):
+        self.gpu = gpu
+
+
+class _FakePageBuilder:
+    """Minimal FlashInferMetadataBuilder stand-in for the wrapper round-trip."""
+
+    def __init__(self, plain_indices: bool):
+        self.paged_kv_indptr = _FakeBuffer([0, 2, 5])
+        self.paged_kv_last_page_len = _FakeBuffer([0, 0, 0])
+        # 0.33: plain tensor; 0.25: CpuGpuBuffer-style `.gpu` view.
+        indices = torch.zeros(8, dtype=torch.int32)
+        self.paged_kv_indices = indices if plain_indices else _GpuViewProbe(indices)
+
+    def _original(
+        self, num_blocks_np, seq_lens_np, block_table_tensor, num_reqs, page_size
+    ):
+        # Stands in for the upstream implementation: fill indptr/indices.
+        num_actual_pages = int(num_blocks_np[:num_reqs].sum())
+        self.paged_kv_indptr.np[1 : num_reqs + 1] = np.cumsum(
+            num_blocks_np[:num_reqs], dtype=np.int32
+        )
+        view = self.paged_kv_indices
+        view = getattr(view, "gpu", view)
+        view[:num_actual_pages] = torch.arange(num_actual_pages, dtype=torch.int32)
+        return view[:num_actual_pages]
+
+
+@pytest.mark.parametrize("plain_indices", [True, False])
+def test_wrapper_round_trip_both_buffer_shapes(plain_indices):
+    """Miss then hit: the wrapper must not touch `.gpu` unconditionally."""
+    from vllm_gguf_plugin.spec_plan_cache import KVIndicesCache, _gpu_buffer
+
+    builder = _FakePageBuilder(plain_indices=plain_indices)
+    cache = KVIndicesCache()
+    block_table = torch.zeros(2, 8, dtype=torch.int32)
+    num_blocks = np.array([2, 3], dtype=np.int32)
+    seq_lens = np.array([32, 33], dtype=np.int32)
+    key = KVIndicesCache.make_key(2, num_blocks, block_table)
+
+    # Simulate a miss: original runs, then the wrapper stores the views.
+    num_actual = int(num_blocks.sum())
+    builder._original(num_blocks, seq_lens, block_table, 2, 16)
+    cache.store(
+        key,
+        _gpu_buffer(builder.paged_kv_indices)[:num_actual],
+        _gpu_buffer(builder.paged_kv_indptr)[:3],
+        num_actual,
+    )
+
+    hit = cache.lookup(key)
+    assert hit is not None
+    indices, indptr, cached_pages = hit
+    assert cached_pages == num_actual
+    assert indices.shape == (num_actual,)
+    assert indices.tolist() == list(range(num_actual))
+    assert indptr.tolist() == [0, 2, 5]

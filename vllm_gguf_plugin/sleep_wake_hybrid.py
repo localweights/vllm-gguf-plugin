@@ -18,14 +18,36 @@ This module monkeypatches init_fp8_kv_scales to handle list/tuple entries
 recursively via _zero_kv_entry.  The rest of the function body (scale
 reset over Attention/MLAAttention modules) is mirrored verbatim from
 upstream.
+
+vLLM >= 0.33 (Model Runner V2): the sleep-mode rework deleted
+``GPUModelRunner.init_fp8_kv_scales`` outright — v1/worker/gpu_worker.py
+``sleep()``/``wake_up()`` suspend/resume through ``sleep_mode_backend`` and no
+longer zero kv_caches after a wake, and teardown detaches caches via
+``clear_layer_kv_caches`` (v1/worker/utils.py), which already handles the
+list-valued entries of hybrid models.  There is nothing left to patch there, so
+the install turns into a documented no-op instead of raising AttributeError.
+See PORT_NOTES_0.33.md.
 """
 
+import logging
 from functools import wraps
 from typing import Any
 
 import torch
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+try:  # vLLM >= 0.33: moved out of vllm.utils.torch_utils
+    from vllm.v1.kv_cache_interface import is_quantized_kv_cache
+except ImportError:  # vLLM <= 0.25: old home of the helper
+    # Resolved through the module (not ``from ... import``) so the static
+    # import audit does not report a MISSING symbol on 0.33, where this
+    # location no longer exports it.
+    from vllm.utils import torch_utils as _torch_utils
+
+    is_quantized_kv_cache = _torch_utils.is_quantized_kv_cache
+
+logger = logging.getLogger(__name__)
 
 
 def _zero_kv_entry(entry: Any) -> None:
@@ -51,18 +73,31 @@ def _patch_init_fp8_kv_scales() -> None:
     Mirrors upstream body (gpu_model_runner.py:964-1005) but uses
     _zero_kv_entry for the kv_caches loop so list entries from mamba/GDN
     groups are handled instead of crashing.
+
+    On vLLM >= 0.33 the patched method no longer exists; the hook is then a
+    no-op (the upstream bug it guarded is gone — see the module docstring).
     """
     if getattr(GPUModelRunner, "_gguf_sleep_wake_patched", False):
         return
 
+    if not hasattr(GPUModelRunner, "init_fp8_kv_scales"):
+        logger.info(
+            "GPUModelRunner.init_fp8_kv_scales is absent in this vLLM "
+            "(removed in 0.33 with the sleep-mode rework); the hybrid "
+            "sleep/wake fix is inert-but-harmless here."
+        )
+        GPUModelRunner._gguf_sleep_wake_patched = True
+        return
+
+    # vLLM >= 0.33 removed this hook with the sleep-mode rework; the
+    # hasattr() guard above is the compatibility path (see PORT_NOTES_0.33.md).
+    # patch-target: inert
     original = GPUModelRunner.init_fp8_kv_scales
 
     @wraps(original)
     @torch.inference_mode()  # upstream decorates the original; mirror it
     def patched_init_fp8_kv_scales(self) -> None:
         # --- upstream body start (gpu_model_runner.py:964-1005) ---
-        from vllm.utils.torch_utils import is_quantized_kv_cache
-
         if not is_quantized_kv_cache(self.cache_config.cache_dtype):
             return
 

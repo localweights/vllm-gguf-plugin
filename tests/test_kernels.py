@@ -17,6 +17,13 @@ from vllm_gguf_plugin.triton.gemm.interface import ggml_mul_mat_a8_triton
 
 from .utils import get_gguf_moe_tensors, get_gguf_sample_tensors, seed_everything
 
+# Every test here launches GGUF kernels on a CUDA device.  Skip cleanly when no
+# GPU is visible (e.g. the CUDA_VISIBLE_DEVICES="" port/gate runs) instead of
+# failing with "No CUDA GPUs are available".
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="kernel tests require a CUDA device"
+)
+
 DTYPES = [torch.half, torch.bfloat16, torch.float32]
 # Hidden_size for testing, must match the sample file in HF repo,
 # we have `hidden_size = 256, 1024` for test in HF repo currently.

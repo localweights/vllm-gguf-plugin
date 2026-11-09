@@ -10,9 +10,17 @@ and never sets `mtp_num_hidden_layers`. This module bridges both gaps by:
   1. tagging the config with mtp_num_hidden_layers (from nextn_predict_layers),
   2. extending SpeculativeConfig.hf_config_override so a draft built from our
      gguf becomes model_type=qwen3_5_mtp / arch=Qwen3_5MTP(MoeMTP).
+
+vLLM >= 0.33 rewrites ``qwen3_5``/``qwen3_5_text`` (and the ``_moe`` variants)
+into ``qwen3_5_mtp`` natively (vllm/config/speculative.py, the
+``hf_config_override`` qwen3_5 branch), and it already prefers the target's
+``model_weights`` when building the draft model.  The override below is kept as
+the superset the GGUF lane has always used (it also sets
+``num_nextn_predict_layers``) and now accepts 0.33's second
+``transformers_mtp_overrides`` argument, which it forwards to the original.
 """
 
-import torch
+import inspect
 
 
 def install() -> None:
@@ -22,8 +30,23 @@ def install() -> None:
         return
 
     _orig = _spec.SpeculativeConfig.hf_config_override
+    # vLLM >= 0.33 passes a second argument (transformers modeling backend
+    # overrides); vLLM <= 0.25 passes only the config.  Detect once instead of
+    # guessing per call.
+    _orig_takes_transformers_overrides = (
+        "transformers_mtp_overrides" in inspect.signature(_orig).parameters
+    )
 
-    def hf_config_override(hf_config):
+    def hf_config_override(hf_config, transformers_mtp_overrides=None):
+        if transformers_mtp_overrides is not None:
+            # vLLM 0.33: the Transformers modeling backend builds its own MTP
+            # draft from the target config and wants only the plain overrides.
+            if _orig_takes_transformers_overrides:
+                return _orig(
+                    hf_config,
+                    transformers_mtp_overrides=transformers_mtp_overrides,
+                )
+            return _orig(hf_config)
         mt = getattr(hf_config, "model_type", None)
         if mt in ("qwen3_5_text", "qwen3_5", "qwen3_5_moe_text", "qwen3_5_moe"):
             is_moe = "moe" in mt

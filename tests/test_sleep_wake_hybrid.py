@@ -11,12 +11,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import CacheConfig, CompilationConfig
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner as _GPUModelRunner
 
 from vllm_gguf_plugin.sleep_wake_hybrid import (
     _patch_init_fp8_kv_scales,
     _zero_kv_entry,
 )
-
 
 # ---- _zero_kv_entry unit tests ----
 
@@ -64,6 +64,18 @@ def test_zero_mixed():
 # We monkeypatch GPUModelRunner.init_fp8_kv_scales, then call it as
 # GPUModelRunner.init_fp8_kv_scales(runner) since SimpleNamespace
 # instances don't inherit the class method.
+#
+# vLLM >= 0.33 (Model Runner V2) removed GPUModelRunner.init_fp8_kv_scales with
+# the sleep-mode rework; the install is then a documented no-op.  The 0.25
+# behaviour is still tested wherever the upstream method exists.
+HAS_FP8_SCALE_HOOK = hasattr(_GPUModelRunner, "init_fp8_kv_scales")
+needs_fp8_hook = pytest.mark.skipif(
+    not HAS_FP8_SCALE_HOOK,
+    reason=(
+        "vLLM >= 0.33 removed GPUModelRunner.init_fp8_kv_scales (sleep-mode "
+        "rework); the hybrid zeroing fix is inert there"
+    ),
+)
 
 
 def _make_fake_runner(
@@ -102,6 +114,7 @@ def _make_fake_runner(
     )
 
 
+@needs_fp8_hook
 def test_patched_fp8_mixed_kv():
     """FP8 dtype with mixed kv_caches (tensor + list + None) -> no crash, all zeroed."""
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -121,6 +134,7 @@ def test_patched_fp8_mixed_kv():
     assert runner.kv_caches[3].tolist() == [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]
 
 
+@needs_fp8_hook
 def test_patched_non_quantized():
     """Non-quantized cache_dtype -> early return, tensors untouched."""
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -136,6 +150,7 @@ def test_patched_non_quantized():
         assert sub.tolist() == [1.0, 1.0] or sub.tolist() == [2.0, 2.0]
 
 
+@needs_fp8_hook
 def test_patched_tensor_only():
     """FP8 dtype with only tensor entries -> works (regression: non-hybrid path)."""
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -148,6 +163,7 @@ def test_patched_tensor_only():
     assert all(t.tolist() == [[0.0, 0.0], [0.0, 0.0]] for t in runner.kv_caches)
 
 
+@needs_fp8_hook
 def test_patched_idempotent():
     """Double call to _patch_init_fp8_kv_scales installs only once."""
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -167,3 +183,36 @@ def test_patched_idempotent():
     runner = _make_fake_runner(cache_dtype="fp8", kv_caches_mixed=True)
     GPUModelRunner.init_fp8_kv_scales(runner)
     assert runner.kv_caches[0].tolist() == [[0.0, 0.0], [0.0, 0.0]]
+
+
+# ---- 0.33: the hook is gone, the install must be a no-op ----
+
+
+@pytest.mark.skipif(
+    HAS_FP8_SCALE_HOOK,
+    reason="this vLLM still has GPUModelRunner.init_fp8_kv_scales",
+)
+def test_install_is_inert_without_upstream_hook():
+    """vLLM >= 0.33 deleted init_fp8_kv_scales; installing must not raise and
+    must not resurrect the attribute (nothing would call it)."""
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    if hasattr(GPUModelRunner, "_gguf_sleep_wake_patched"):
+        delattr(GPUModelRunner, "_gguf_sleep_wake_patched")
+
+    _patch_init_fp8_kv_scales()  # documented no-op, no AttributeError
+    assert not hasattr(GPUModelRunner, "init_fp8_kv_scales")
+    assert GPUModelRunner._gguf_sleep_wake_patched is True
+
+    # Second call is still idempotent.
+    _patch_init_fp8_kv_scales()
+    assert not hasattr(GPUModelRunner, "init_fp8_kv_scales")
+
+
+def test_zero_kv_entry_still_used_by_025_path():
+    """The list-aware zeroing helper the 0.25 wrapper relies on is exercised
+    directly, so it cannot rot silently while the 0.33 path skips it."""
+    entry = [torch.full((1,), 2.0), [torch.full((1,), 3.0)]]
+    _zero_kv_entry(entry)
+    assert entry[0].tolist() == [0.0]
+    assert entry[1][0].tolist() == [0.0]

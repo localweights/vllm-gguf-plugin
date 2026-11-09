@@ -157,6 +157,17 @@ class KVIndicesCache:
         self._num_actual_pages = None
 
 
+def _gpu_buffer(buffer) -> torch.Tensor:
+    """GPU tensor behind a FlashInfer persistent buffer.
+
+    vLLM 0.25 keeps ``paged_kv_indices`` in a ``CpuGpuBuffer`` (``.gpu`` view);
+    vLLM 0.33 allocates it as a plain CUDA tensor directly
+    (v1/attention/backends/flashinfer.py, ``self.paged_kv_indices = torch.zeros(
+    max_num_pages, ...)``).  Accept both.
+    """
+    return getattr(buffer, "gpu", buffer)
+
+
 def install() -> None:
     """Monkeypatch ``FlashInferMetadataBuilder._compute_flashinfer_kv_metadata``
     to reuse ``paged_kv_indices``/``paged_kv_indptr`` GPU tensors when the
@@ -209,7 +220,7 @@ def install() -> None:
             # Buffers are the persistent self.paged_kv_indices/indptr
             # tensors -- their content is unchanged since the version
             # check passed, so the views below are still correct.
-            return self.paged_kv_indices.gpu[:num_actual_pages]
+            return _gpu_buffer(self.paged_kv_indices)[:num_actual_pages]
 
         # Miss: fall back to the original (correct, unmodified) path.
         result = _orig_compute(
@@ -218,8 +229,8 @@ def install() -> None:
         num_actual_pages = int(self.paged_kv_indptr.np[num_reqs])
         cache.store(
             key,
-            self.paged_kv_indices.gpu[:num_actual_pages],
-            self.paged_kv_indptr.gpu[: num_reqs + 1],
+            _gpu_buffer(self.paged_kv_indices)[:num_actual_pages],
+            _gpu_buffer(self.paged_kv_indptr)[: num_reqs + 1],
             num_actual_pages,
         )
         return result

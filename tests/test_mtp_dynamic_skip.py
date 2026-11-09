@@ -7,14 +7,25 @@ the original SpecDecodeBaseProposer.propose is replaced with a recorder
 so we can assert exactly when the draft forward would have run.
 """
 
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
 import torch
-
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
 import vllm_gguf_plugin.mtp_dynamic_skip as mds
+
+# Model Runner V2 speculators only exist on vLLM >= 0.29.
+_MRV2_AVAILABLE = (
+    importlib.util.find_spec(
+        "vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator"
+    )
+    is not None
+)
+needs_mrv2 = pytest.mark.skipif(
+    not _MRV2_AVAILABLE, reason="this vLLM has no Model Runner V2 speculators"
+)
 
 
 class _Recorder:
@@ -157,3 +168,173 @@ def test_positional_args_supported(patched):
     )
     assert patched.calls == []
     assert out.shape == (4, 0)
+
+
+# ---------------------------------------------------------------------------
+# Model Runner V2 (default since vLLM 0.29): the drafter is a Speculator
+# ---------------------------------------------------------------------------
+# MRV2 does not call SpecDecodeBaseProposer at all; TargetDependentARSpeculator
+# (base of MTPSpeculator) runs the draft prefill forward on a k=0 step and only
+# skips sampling.  The wrapper must skip that forward identically.
+
+
+class _MVR2Recorder:
+    """Stands in for the original speculator propose (the draft forward)."""
+
+    def __init__(self):
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def __call__(self, speculator, input_batch, *args, **kwargs):
+        self.calls.append(((input_batch, *args), dict(kwargs)))
+        num_reqs = input_batch.num_reqs
+        return torch.zeros(
+            num_reqs, getattr(speculator, "num_speculative_steps", 1), dtype=torch.int64
+        )
+
+
+@pytest.fixture
+def mrv2_patched(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+        TargetDependentARSpeculator,
+    )
+
+    recorder = _MVR2Recorder()
+    monkeypatch.setattr(TargetDependentARSpeculator, "propose", recorder, raising=True)
+    monkeypatch.setattr(
+        TargetDependentARSpeculator,
+        "_gguf_dynamic_k0_skip_patched",
+        False,
+        raising=False,
+    )
+    mds._install_mrv2()
+    yield recorder
+    TargetDependentARSpeculator._gguf_dynamic_k0_skip_patched = False
+
+
+class _FakeSpeculator:
+    """Instance-shaped stand-in (no engine boot)."""
+
+    def __init__(self, dynamic: bool, num_steps: int = 2, num_reqs: int = 3):
+        self.speculative_config = SimpleNamespace(
+            uses_dynamic_speculative_decoding=lambda: dynamic
+        )
+        self.num_speculative_steps = num_steps
+        self.draft_tokens = torch.ones(num_reqs, num_steps, dtype=torch.int64)
+
+
+def _run_mrv2(speculator, **kwargs):
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+        TargetDependentARSpeculator,
+    )
+
+    return TargetDependentARSpeculator.propose(
+        speculator, SimpleNamespace(num_reqs=3), **kwargs
+    )
+
+
+@needs_mrv2
+def test_mrv2_k0_dynamic_skips_draft_forward(mrv2_patched):
+    spec = _FakeSpeculator(dynamic=True)
+    out = _run_mrv2(spec, num_speculative_tokens=0)
+
+    assert mrv2_patched.calls == [], "k=0 step must never reach the draft forward"
+    assert out.shape == (3, 2)
+    assert torch.all(out == -1), "mirror upstream's k==0 draft_tokens fill"
+
+
+@needs_mrv2
+def test_mrv2_k_positive_unchanged(mrv2_patched):
+    spec = _FakeSpeculator(dynamic=True)
+    sentinel = object()
+    out = _run_mrv2(spec, num_speculative_tokens=2, dummy_run=False, marker=sentinel)
+
+    assert len(mrv2_patched.calls) == 1
+    _, called_kwargs = mrv2_patched.calls[0]
+    assert called_kwargs["marker"] is sentinel
+    assert called_kwargs["num_speculative_tokens"] == 2
+    assert out.shape == (3, 2)
+
+
+@needs_mrv2
+def test_mrv2_k0_static_config_falls_through(mrv2_patched):
+    spec = _FakeSpeculator(dynamic=False)
+    _run_mrv2(spec, num_speculative_tokens=0)
+    assert len(mrv2_patched.calls) == 1, "static config: upstream handles k=0 itself"
+
+
+@needs_mrv2
+def test_mrv2_never_skips_dummy_or_profile_runs(mrv2_patched):
+    """Cudagraph capture / memory profiling must run the real forward."""
+    for flag in ("dummy_run", "is_profile"):
+        mrv2_patched.calls.clear()
+        spec = _FakeSpeculator(dynamic=True)
+        _run_mrv2(spec, num_speculative_tokens=0, **{flag: True})
+        assert len(mrv2_patched.calls) == 1, f"{flag}=True must not be skipped"
+
+
+@needs_mrv2
+def test_mrv2_none_k_resolves_to_static_steps(mrv2_patched):
+    """num_speculative_tokens=None means "self.num_speculative_steps" (non-zero
+    here), so the forward runs."""
+    spec = _FakeSpeculator(dynamic=True, num_steps=2)
+    _run_mrv2(spec, num_speculative_tokens=None)
+    assert len(mrv2_patched.calls) == 1
+
+
+@needs_mrv2
+def test_mrv2_install_idempotent(mrv2_patched):
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+        TargetDependentARSpeculator,
+    )
+
+    before = TargetDependentARSpeculator.propose
+    mds._install_mrv2()
+    assert TargetDependentARSpeculator.propose is before
+
+
+def test_install_wires_mrv1():
+    """Wiring proof: install() patches the MRV1 proposer."""
+    SpecDecodeBaseProposer._gguf_dynamic_k0_skip_patched = False
+    mds.install()
+    assert SpecDecodeBaseProposer._gguf_dynamic_k0_skip_patched is True
+
+
+@needs_mrv2
+def test_install_wires_mrv2():
+    """Wiring proof: install() patches the MRV2 MTP speculator base too."""
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+        TargetDependentARSpeculator,
+    )
+
+    TargetDependentARSpeculator._gguf_dynamic_k0_skip_patched = False
+    mds.install()
+    assert TargetDependentARSpeculator._gguf_dynamic_k0_skip_patched is True
+
+
+@needs_mrv2
+def test_mrv2_positional_flags_respected(mrv2_patched):
+    """A fully positional call must still resolve k and the dummy/profile flags
+    (the wrapper may not assume keywords)."""
+    spec = _FakeSpeculator(dynamic=True)
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+        TargetDependentARSpeculator,
+    )
+
+    # attn_metadata, slot_mappings, last_hidden_states, aux_hidden_states,
+    # num_sampled, num_rejected, last_sampled, next_prefill_tokens, temperature,
+    # seeds, dp_sync_state, dummy_run, skip_attn_for_dummy_run, mm_inputs,
+    # is_profile, num_speculative_tokens
+    positional = [None] * 16
+    positional[15] = 0  # k = 0 -> would be skipped ...
+    positional[14] = True  # ... but this is a profiling run (is_profile=True)
+    TargetDependentARSpeculator.propose(
+        spec, SimpleNamespace(num_reqs=3), *positional
+    )
+    assert len(mrv2_patched.calls) == 1, "positional is_profile=True must not skip"
+
+    mrv2_patched.calls.clear()
+    positional[14] = False
+    TargetDependentARSpeculator.propose(
+        spec, SimpleNamespace(num_reqs=3), *positional
+    )
+    assert mrv2_patched.calls == [], "positional k=0 step must be skipped"
