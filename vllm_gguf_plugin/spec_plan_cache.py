@@ -76,6 +76,16 @@ SAFE SUBSET ACTUALLY IMPLEMENTED (B2-narrow):
   the profiled 27% bucket, not the dominant cost inside it (the
   FlashInfer `.plan()` call itself, gated above as unsafe to skip).
 
+INFERENCE TENSORS (vLLM 0.33 / Model Runner V2): under MRV2 the block
+table is built inside ``torch.inference_mode()`` during
+``capture_model``. Inference tensors do NOT track ``_version`` (reading
+it raises ``RuntimeError: Inference tensors do not track version
+counter.``), so the version-uniqueness proof above is UNAVAILABLE for
+that call. ``make_key`` therefore returns ``None`` (a key that can
+never equal a stored one) for such tensors, and ``lookup``/``store``
+treat ``None`` as "miss, do not store" -- the call takes the full
+recompute path. Correctness over speed: never serve stale indices.
+
 Gated by env var GGUF_PLUGIN_PLAN_CACHE (default "1" / on). Set to "0"
 to fully disable and fall back to unpatched upstream behavior.
 """
@@ -124,14 +134,38 @@ class KVIndicesCache:
         num_reqs: int,
         num_blocks_np: np.ndarray,
         block_table_tensor: torch.Tensor,
-    ) -> tuple[Any, ...]:
+    ) -> tuple[Any, ...] | None:
+        """Cache key, or ``None`` when the key cannot be trusted.
+
+        ``None`` means "do not use the cache for this call": inference
+        tensors (``torch.inference_mode()``, used by vLLM 0.33 Model
+        Runner V2 during model capture) carry no ``_version`` counter, so
+        there is no proof the block table is unchanged -- a full recompute
+        is the only correct answer.
+        """
+        is_inference = getattr(block_table_tensor, "is_inference", None)
+        if is_inference is not None and is_inference():
+            return None
+        try:
+            version = block_table_tensor._version
+        except RuntimeError:
+            # torch: "Inference tensors do not track version counter."
+            return None
         return (
             num_reqs,
             num_blocks_np[:num_reqs].tobytes(),
-            block_table_tensor._version,
+            version,
         )
 
-    def lookup(self, key: tuple[Any, ...]):
+    def lookup(self, key: tuple[Any, ...] | None):
+        if key is None:
+            # No-cache key (inference tensor): always a miss. The full
+            # recompute that follows rewrites the SAME persistent buffers the
+            # cached entry points at, so the stored key must be dropped too;
+            # otherwise a later matching key would serve overwritten indices.
+            self.misses += 1
+            self._key = None
+            return None
         if self._key is not None and key == self._key:
             self.hits += 1
             return self._indices, self._indptr, self._num_actual_pages
@@ -140,11 +174,14 @@ class KVIndicesCache:
 
     def store(
         self,
-        key: tuple[Any, ...],
+        key: tuple[Any, ...] | None,
         indices: torch.Tensor,
         indptr: torch.Tensor,
         num_actual_pages: int,
     ) -> None:
+        if key is None:
+            # Nothing verifiable to key on: store nothing, overwrite nothing.
+            return
         self._key = key
         self._indices = indices
         self._indptr = indptr

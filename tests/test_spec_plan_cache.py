@@ -269,3 +269,114 @@ def test_wrapper_round_trip_both_buffer_shapes(plain_indices):
     assert indices.shape == (num_actual,)
     assert indices.tolist() == list(range(num_actual))
     assert indptr.tolist() == [0, 2, 5]
+
+
+# ---------------------------------------------------------------------------
+# MRV2 / torch inference_mode: no version counter -> the cache must not be used
+# ---------------------------------------------------------------------------
+#
+# Gate A (vLLM 0.33.0 boot, MTP OFF) crashed in `make_key` with
+#   RuntimeError: Inference tensors do not track version counter.
+# Under Model Runner V2 the block table is built under `torch.inference_mode()`,
+# and inference tensors expose no `_version`, so the version-based correctness
+# proof used by the cache is unavailable. Correctness over speed: such a call
+# must take the full-recompute path (no-cache key -> guaranteed miss, nothing
+# stored), never a possibly-stale hit.
+
+
+def _inference_tensor():
+    with torch.inference_mode():
+        return torch.zeros(2, 8, dtype=torch.int32)
+
+
+def test_make_key_on_inference_tensor_is_no_cache_key():
+    """`make_key` must not raise under inference_mode, and must return a key
+    that can never equal a stored one."""
+    blocks = np.array([1, 1], dtype=np.int32)
+    t = _inference_tensor()
+    assert t.is_inference()
+    assert KVIndicesCache.make_key(2, blocks, t) is None
+
+
+def test_inference_tensor_lookup_misses_and_stores_nothing():
+    cache = KVIndicesCache()
+    blocks = np.array([1, 1], dtype=np.int32)
+
+    normal_key = KVIndicesCache.make_key(2, blocks, _fake_tensor(version=0))
+    assert normal_key is not None
+    stored_indices = torch.tensor([0, 1])
+    cache.store(normal_key, stored_indices, torch.tensor([0, 1, 2]), 2)
+
+    inf_key = KVIndicesCache.make_key(2, blocks, _inference_tensor())
+    assert inf_key is None
+
+    # Miss -- the wrapper then runs the original (full recompute) path.
+    assert cache.lookup(inf_key) is None
+    assert cache.hits == 0
+    assert cache.misses == 1
+
+    # Store with the no-cache key is a no-op, AND the earlier entry is gone:
+    # the full recompute rewrote the persistent buffers that entry points at,
+    # so serving it on a later matching key would return overwritten indices.
+    cache.store(inf_key, torch.tensor([7]), torch.tensor([0, 7]), 1)
+    assert cache.lookup(inf_key) is None
+    assert cache.lookup(normal_key) is None
+
+
+def test_make_key_treats_version_runtime_error_as_no_cache_key():
+    """Belt and braces: an object that has no usable `is_inference` marker but
+    whose `_version` read raises RuntimeError (exactly what an inference tensor
+    does) must also degrade to the no-cache key, not propagate."""
+
+    class _NoVersionTensor:
+        @property
+        def _version(self):
+            raise RuntimeError(
+                "Inference tensors do not track version counter."
+            )
+
+        def is_inference(self):
+            return False  # lies -- the RuntimeError is the real signal
+
+    key = KVIndicesCache.make_key(
+        2, np.array([1, 1], dtype=np.int32), _NoVersionTensor()
+    )
+    assert key is None
+
+
+def test_normal_tensor_hit_then_miss_after_inplace_version_bump():
+    """Unchanged behaviour for normal tensors: same version -> hit, any
+    in-place write (version bump) -> miss."""
+    cache = KVIndicesCache()
+    blocks = np.array([2, 3], dtype=np.int32)
+    block_table = torch.zeros(2, 8, dtype=torch.int32)
+
+    key1 = KVIndicesCache.make_key(2, blocks, block_table)
+    assert key1 is not None
+    assert not block_table.is_inference()
+    cache.store(key1, torch.tensor([0, 1]), torch.tensor([0, 2, 5]), 2)
+    assert cache.lookup(KVIndicesCache.make_key(2, blocks, block_table)) is not None
+    assert cache.hits == 1
+
+    block_table[0, 0] = 7  # in-place write -> torch bumps ._version
+    key2 = KVIndicesCache.make_key(2, blocks, block_table)
+    assert key2 is not None
+    assert key2 != key1
+    assert cache.lookup(key2) is None
+
+
+def test_inference_key_invalidates_previous_entry():
+    """A no-cache (None) lookup must drop the stored entry: the recompute that
+    follows overwrites the persistent buffers the old entry points at."""
+    import numpy as np
+    import torch
+    from vllm_gguf_plugin.spec_plan_cache import KVIndicesCache
+
+    cache = KVIndicesCache()
+    bt = torch.zeros(2, 4, dtype=torch.int32)
+    nb = np.array([1, 1], dtype=np.int32)
+    key = KVIndicesCache.make_key(2, nb, bt)
+    cache.store(key, torch.zeros(2), torch.zeros(3), 2)
+    assert cache.lookup(key) is not None
+    assert cache.lookup(None) is None
+    assert cache.lookup(key) is None

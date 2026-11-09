@@ -18,6 +18,12 @@ into ``qwen3_5_mtp`` natively (vllm/config/speculative.py, the
 the superset the GGUF lane has always used (it also sets
 ``num_nextn_predict_layers``) and now accepts 0.33's second
 ``transformers_mtp_overrides`` argument, which it forwards to the original.
+
+Second 0.33 gap: ``SpeculativeConfig.model`` for MTP arrives as the raw
+``.gguf`` FILE path (the CLI's --speculative-model) while the draft needs the
+target's hf-config DIRECTORY; ``__post_init__`` below rewrites it before
+calling the original, so the draft ``ModelConfig`` is built from a valid
+config source and gets the ``.gguf`` via ``model_weights``.
 """
 
 import inspect
@@ -75,9 +81,46 @@ def install() -> None:
     # rewrites the target's `model` to the hf-config dir) and an empty
     # model_weights, so the gguf loader can't find the .gguf. Propagate the
     # target's model_weights (the actual .gguf file) to the draft.
+    #
+    # vLLM >= 0.33 also needs the PRE-step below: `arg_utils.create_speculative_config`
+    # passes --speculative-model straight through, so for the GGUF lane
+    # `SpeculativeConfig.model` is the raw .gguf FILE, and upstream's own
+    # `__post_init__` builds `ModelConfig(model=self.model, runner="draft", ...)`
+    # from it -> HFValidationError (a .gguf path is not an HF repo id / config
+    # dir). `model=None` (mtp) is just as broken: upstream falls back to
+    # `target_model_config.model_weights` (also the .gguf). Fix: before the
+    # original runs, point `self.model` at the target's hf-config DIRECTORY.
     _orig_post = _spec.SpeculativeConfig.__post_init__
 
+    def _is_mtp_method(method) -> bool:
+        # 0.33 normalises every MTP alias in MTPModelTypes to "mtp"
+        # (`deepseek_mtp`, `qwen3_5_mtp`, ... -> "mtp"), but that happens inside
+        # the original __post_init__, i.e. after this wrapper's pre-step.
+        return isinstance(method, str) and (
+            method == "mtp" or method.endswith("_mtp")
+        )
+
+    def _needs_config_dir(model) -> bool:
+        # None -> upstream would substitute the .gguf; a .gguf path is never a
+        # config source. Anything else is left exactly as configured.
+        return model is None or str(model).lower().endswith(".gguf")
+
     def __post_init__(self):
+        tmc = getattr(self, "target_model_config", None)
+        if (
+            tmc is not None
+            and _is_mtp_method(getattr(self, "method", None))
+            and _needs_config_dir(getattr(self, "model", None))
+        ):
+            config_dir = getattr(tmc, "model", None)
+            if config_dir:
+                print(
+                    f"[mtp_enable] draft model source {self.model!r} is not an "
+                    f"hf-config dir; using target config dir {config_dir!r} "
+                    f"(weights come from model_weights).",
+                    flush=True,
+                )
+                self.model = config_dir
         _orig_post(self)
         dmc = getattr(self, "draft_model_config", None)
         tmc = getattr(self, "target_model_config", None)
